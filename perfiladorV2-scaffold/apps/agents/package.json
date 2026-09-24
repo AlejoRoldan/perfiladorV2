@@ -1,0 +1,10 @@
+{
+  "name": "@perfilador/agents",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}

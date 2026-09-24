@@ -1,0 +1,12 @@
+{
+  "name": "@perfilador/api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "nest start --watch",
+    "build": "nest build",
+    "start": "node dist/main",
+    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
+    "typecheck": "tsc --noEmit"
+  }
+}

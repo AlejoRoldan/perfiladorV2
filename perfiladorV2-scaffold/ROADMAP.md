@@ -1,0 +1,25 @@
+# Roadmap de Implementación - TechProfiler & L&D Platform
+
+- [ ] **Fase 1: Infraestructura y Datos Fundacionales**
+  - [ ] Validar inicialización de PostgreSQL 16 con `pgvector` y Redis
+  - [ ] Implementar esquema DDL en `packages/database` con Drizzle ORM
+  - [ ] Configurar seed inicial con taxonomía de 15 habilidades clave
+  - [ ] Implementar `packages/schemas` con contratos Zod de evaluación y módulos L&D
+- [ ] **Fase 2: Motor de Ingesta y Sanitización**
+  - [ ] Implementar `SecretSanitizer` en `packages/sanitizer` (detección de tokens, llaves y URLs)
+  - [ ] Suite de pruebas unitarias exhaustiva para `SecretSanitizer`
+  - [ ] Webhook controller en `apps/api` para eventos de Pull Request y Review de GitHub
+- [ ] **Fase 3: Runtime de Agentes de Evaluación**
+  - [ ] Implementar `CodeQualityProfilerAgent` con Vercel AI SDK / Gemini y Zod
+  - [ ] Implementar `ReviewerDynamicsAgent` para calificar feedback en PRs
+  - [ ] Implementar `SkillSynthesizerAgent` con decaimiento temporal exponencial
+  - [ ] Implementar `CurriculumBuilderAgent` para generar especificaciones de cursos y labs
+  - [ ] Fixtures y tests deterministas con mocks
+- [ ] **Fase 4: Orquestación Asíncrona (Colas y Workers)**
+  - [ ] Configuración de colas BullMQ (`IngestQueue`, `AgentEvalQueue`, `CourseGenQueue`)
+  - [ ] Procesadores de colas con reintentos y actualización de `developer_skill_matrix`
+  - [ ] Endpoints tRPC / REST para consultar el radar de habilidades
+- [ ] **Fase 5: Interfaz Web y Runner de Retos**
+  - [ ] Dashboard de Radar de Competencias y desglose de evidencias en `apps/web`
+  - [ ] Integración de Monaco Editor para el PR Review Simulator y Refactor Labs
+  - [ ] Visor de Módulos L&D con evaluación interactiva
