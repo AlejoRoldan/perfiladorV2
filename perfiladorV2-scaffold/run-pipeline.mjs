@@ -1,6 +1,11 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import {
+  codeEvaluationResponseSchema,
+  learningModuleResponseSchema,
+  parseJsonWithSchema
+} from './packages/schemas/src/ai-contracts.mjs';
 
 dotenv.config();
 
@@ -88,7 +93,11 @@ Responde ÚNICAMENTE en JSON:
     contents: evalPrompt,
     config: { responseMimeType: 'application/json' }
   });
-  const evaluationData = JSON.parse(evalResponse.text.trim());
+  const evaluationData = parseJsonWithSchema(
+    evalResponse.text,
+    codeEvaluationResponseSchema,
+    'CodeQualityProfilerAgent response'
+  );
 
   // 4. Guardar evidencia en evaluation_signals
   console.log("💾 Paso 4: Registrando señal de evaluación en Supabase...");
@@ -159,7 +168,11 @@ Responde ÚNICAMENTE en JSON con esta estructura exacta:
       contents: coursePrompt,
       config: { responseMimeType: 'application/json' }
     });
-    const courseData = JSON.parse(courseResponse.text.trim());
+    const courseData = parseJsonWithSchema(
+      courseResponse.text,
+      learningModuleResponseSchema,
+      'CurriculumBuilderAgent response'
+    );
 
     // Guardar el curso generado en Supabase
     const savedCourse = await db.query(`
