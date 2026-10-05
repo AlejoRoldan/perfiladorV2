@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "../database/drizzle/seed.ts"],
   "exclude": ["src/**/*.test.ts", "dist", "node_modules"]
 }

@@ -64,6 +64,7 @@ export const SkillEvaluationItemSchema = z.object({
 });
 export type SkillEvaluationItem = z.infer<typeof SkillEvaluationItemSchema>;
 
+// Evaluación de Código / PR
 export const CodeQualityEvaluationSchema = z.object({
   summary: z.string(),
   overallScore: z.number().min(1.0).max(5.0),
@@ -77,6 +78,57 @@ export const CodeQualityEvaluationSchema = z.object({
   ).default([])
 });
 export type CodeQualityEvaluation = z.infer<typeof CodeQualityEvaluationSchema>;
+
+// Evaluación de Dinámicas de Code Review
+export const ReviewerDynamicsEvaluationSchema = z.object({
+  summary: z.string(),
+  overallScore: z.number().min(1.0).max(5.0),
+  skillEvaluations: z.array(SkillEvaluationItemSchema),
+  toneAnalysis: z.object({
+    empathyScore: z.number().min(1.0).max(5.0),
+    pedagogyScore: z.number().min(1.0).max(5.0),
+    constructiveness: z.enum(['EXCELLENT', 'ADEQUATE', 'PUNITIVE_OR_BLUNT']),
+    observations: z.string()
+  }),
+  actionableSuggestionsDetected: z.boolean().default(true),
+  keyStrengths: z.array(z.string()).default([]),
+  improvementAreas: z.array(z.string()).default([])
+});
+export type ReviewerDynamicsEvaluation = z.infer<typeof ReviewerDynamicsEvaluationSchema>;
+
+// Reporte de Síntesis del Tech Radar
+export const SkillSynthesisReportSchema = z.object({
+  developerId: z.string().uuid(),
+  synthesizedAt: z.string(),
+  overallTrend: z.enum(['ACCELERATING', 'STABLE', 'NEEDS_ATTENTION']),
+  summary: z.string(),
+  skillSynthesis: z.array(
+    z.object({
+      skillKey: z.string(),
+      synthesizedScore: z.number().min(1.0).max(5.0),
+      confidenceScore: z.number().min(0.0).max(1.0),
+      signalCount: z.number().int().min(0),
+      requiredScore: z.number(),
+      gapVsTarget: z.number(),
+      status: z.enum(['EXCEEDED', 'ON_TRACK', 'DEFICIT'])
+    })
+  ),
+  criticalGaps: z.array(z.string()).default([]),
+  recommendedFocus: z.array(z.string()).default([])
+});
+export type SkillSynthesisReport = z.infer<typeof SkillSynthesisReportSchema>;
+
+// Especificación de Módulo de Aprendizaje y Laboratorio (Curriculum Builder)
+export const CurriculumModuleSpecSchema = z.object({
+  title: z.string(),
+  skillKey: z.string(),
+  explanation: z.string(),
+  challengeScenario: z.string(),
+  solutionTemplate: z.string().optional(),
+  verificationCriteria: z.array(z.string()).default([]),
+  estimatedMinutes: z.number().int().min(5).max(60).default(20)
+});
+export type CurriculumModuleSpec = z.infer<typeof CurriculumModuleSpecSchema>;
 
 export const ProofOfSkillsVerdictSchema = z.object({
   summary: z.string(),
