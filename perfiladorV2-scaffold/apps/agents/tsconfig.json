@@ -10,7 +10,8 @@
     "forceConsistentCasingInFileNames": true,
     "paths": {
       "@perfilador/sanitizer": ["../../packages/sanitizer/src/index.ts"],
-      "@perfilador/schemas": ["../../packages/schemas/src/index.ts"]
+      "@perfilador/schemas": ["../../packages/schemas/src/index.ts"],
+      "@perfilador/database": ["../../packages/database/src/index.ts"]
     }
   },
   "include": ["src/**/*"]
