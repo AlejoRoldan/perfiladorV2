@@ -1,13 +1,19 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import pg from 'pg';
 import dotenv from 'dotenv';
 
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const packageRoot = path.resolve(scriptDir, '..');
+const projectRoot = path.resolve(packageRoot, '../..');
+
+dotenv.config({ path: path.join(projectRoot, '.env') });
+dotenv.config();
 
 const { Client } = pg;
 const mode = process.argv[2] || 'all';
-const root = path.resolve('packages/database');
+const root = packageRoot;
 
 const groups = {
   migrate: [path.join(root, 'migrations')],
@@ -35,10 +41,19 @@ async function sqlFilesFor(dir) {
 
 const client = new Client({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL.includes('localhost')
+  ssl: isLocalDatabaseUrl(process.env.DATABASE_URL)
     ? false
-    : { rejectUnauthorized: false }
+    : true
 });
+
+function isLocalDatabaseUrl(databaseUrl) {
+  try {
+    const { hostname } = new URL(databaseUrl);
+    return ['localhost', '127.0.0.1', 'db'].includes(hostname);
+  } catch {
+    return false;
+  }
+}
 
 try {
   await client.connect();

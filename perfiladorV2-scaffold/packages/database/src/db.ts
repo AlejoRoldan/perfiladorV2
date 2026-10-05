@@ -1,18 +1,35 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
 import dotenv from 'dotenv';
-import path from 'path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as schema from './schema';
 
-dotenv.config({ path: path.resolve(process.cwd(), '../../.env') });
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+const packageDir = dirname(fileURLToPath(import.meta.url));
+const projectRoot = resolve(packageDir, '../../..');
+
+dotenv.config({ path: resolve(projectRoot, '.env') });
 dotenv.config();
 
-const connectionString = process.env.DATABASE_URL || '';
+export function resolveDatabaseUrl(env = process.env) {
+  if (!env.DATABASE_URL) {
+    throw new Error('DATABASE_URL is required for @perfilador/database.');
+  }
 
-export const pool = new pg.Pool({
-  connectionString,
-  ssl: { rejectUnauthorized: false }
-});
+  return env.DATABASE_URL;
+}
 
+export function isLocalDatabaseUrl(databaseUrl: string) {
+  const { hostname } = new URL(databaseUrl);
+  return ['localhost', '127.0.0.1', 'db'].includes(hostname);
+}
+
+export function createDatabasePool(connectionString = resolveDatabaseUrl()) {
+  return new pg.Pool({
+    connectionString,
+    ssl: isLocalDatabaseUrl(connectionString) ? false : true
+  });
+}
+
+export const pool = createDatabasePool();
 export const db = drizzle(pool, { schema });
