@@ -107,6 +107,21 @@ function assertPostRequestAllowed(req) {
   }
 }
 
+function csvEscape(value) {
+  const text = String(value ?? '');
+  if (/[",\r\n]/.test(text)) {
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+  return text;
+}
+
+function rowsToCsv(headers, rows) {
+  return [
+    headers.map(csvEscape).join(','),
+    ...rows.map(row => headers.map(header => csvEscape(row[header])).join(','))
+  ].join('\r\n') + '\r\n';
+}
+
 function normalizeHistory(history) {
   return Array.isArray(history)
     ? history.map(item => ({
@@ -394,6 +409,87 @@ async function importCollaborators({ csvText }) {
   }
 
   return { success: errors.length === 0, importedCount: imported.length, errorCount: errors.length, imported, errors };
+}
+
+async function buildIttiPilotReportRows() {
+  const result = await query(`
+    WITH skill_summary AS (
+      SELECT
+        dsm.developer_id,
+        COUNT(*)::int AS skill_count,
+        ROUND(AVG(dsm.current_score)::numeric, 2) AS avg_score,
+        ROUND(AVG(dsm.gap_vs_target)::numeric, 2) AS avg_gap,
+        MIN(dsm.gap_vs_target) AS worst_gap
+      FROM developer_skill_matrix dsm
+      GROUP BY dsm.developer_id
+    ),
+    pos_summary AS (
+      SELECT
+        es.developer_id,
+        COUNT(*)::int AS pos_sessions,
+        MAX(es.created_at) AS last_pos_at,
+        (ARRAY_AGG(es.external_ref ORDER BY es.created_at DESC))[1] AS last_external_ref
+      FROM evaluation_signals es
+      WHERE es.source_type = 'CONVERSATIONAL_PROOF_OF_SKILL'
+      GROUP BY es.developer_id
+    ),
+    module_summary AS (
+      SELECT
+        lm.developer_id,
+        COUNT(*) FILTER (WHERE lm.status = 'ASSIGNED')::int AS assigned_modules,
+        COUNT(*) FILTER (WHERE lm.status = 'IN_PROGRESS')::int AS in_progress_modules,
+        COUNT(*) FILTER (WHERE lm.status = 'COMPLETED')::int AS completed_modules
+      FROM learning_modules lm
+      GROUP BY lm.developer_id
+    )
+    SELECT
+      d.email,
+      d.current_seniority,
+      d.target_seniority,
+      d.tech_track,
+      CASE WHEN COALESCE(ps.pos_sessions, 0) > 0 THEN 'COMPLETED' ELSE 'PENDING' END AS pos_status,
+      COALESCE(ps.pos_sessions, 0)::int AS pos_sessions,
+      COALESCE(ps.last_external_ref, '') AS last_external_ref,
+      COALESCE(to_char(ps.last_pos_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS last_pos_at,
+      COALESCE(ss.skill_count, 0)::int AS evaluated_skills,
+      COALESCE(ss.avg_score, 0)::numeric AS avg_score,
+      COALESCE(ss.avg_gap, 0)::numeric AS avg_gap,
+      COALESCE(ss.worst_gap, 0)::numeric AS worst_gap,
+      COALESCE(ms.assigned_modules, 0)::int AS assigned_modules,
+      COALESCE(ms.in_progress_modules, 0)::int AS in_progress_modules,
+      COALESCE(ms.completed_modules, 0)::int AS completed_modules
+    FROM developers d
+    JOIN organizations o ON o.id = d.org_id
+    LEFT JOIN skill_summary ss ON ss.developer_id = d.id
+    LEFT JOIN pos_summary ps ON ps.developer_id = d.id
+    LEFT JOIN module_summary ms ON ms.developer_id = d.id
+    WHERE o.slug = $1
+    ORDER BY d.email ASC
+  `, [PILOT_IMPORT_ORG_SLUG]);
+
+  return result.rows;
+}
+
+async function buildIttiPilotReportCsv() {
+  const headers = [
+    'email',
+    'current_seniority',
+    'target_seniority',
+    'tech_track',
+    'pos_status',
+    'pos_sessions',
+    'last_external_ref',
+    'last_pos_at',
+    'evaluated_skills',
+    'avg_score',
+    'avg_gap',
+    'worst_gap',
+    'assigned_modules',
+    'in_progress_modules',
+    'completed_modules'
+  ];
+  const rows = await buildIttiPilotReportRows();
+  return rowsToCsv(headers, rows);
 }
 
 async function startPoS(devId) {
@@ -714,7 +810,10 @@ bruno.rios@itti.digital,MID_1,SENIOR_1,FULLSTACK</textarea>
         </div>
         <div class="flex items-center justify-between gap-3">
           <p class="text-[11px] text-slate-500">Organizacion destino: itti Digital</p>
-          <button onclick="importCollaborators()" id="btnImportCsv" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition">Importar CSV</button>
+          <div class="flex gap-2">
+            <button onclick="exportIttiReport()" id="btnExportReport" class="bg-slate-800 hover:bg-slate-700 text-white font-bold px-4 py-2 rounded-xl text-xs border border-slate-700 transition">Exportar reporte</button>
+            <button onclick="importCollaborators()" id="btnImportCsv" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition">Importar CSV</button>
+          </div>
         </div>
       </section>
 
@@ -832,6 +931,37 @@ bruno.rios@itti.digital,MID_1,SENIOR_1,FULLSTACK</textarea>
       } finally {
         btn.disabled = false;
         btn.textContent = 'Importar CSV';
+      }
+    }
+
+    async function exportIttiReport() {
+      const btn = document.getElementById('btnExportReport');
+      const adminToken = document.getElementById('adminImportToken').value.trim();
+      btn.disabled = true;
+      btn.textContent = 'Exportando...';
+      try {
+        const res = await fetch('/api/admin/itti-report', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
+          body: JSON.stringify({ format: 'csv' })
+        });
+        const text = await res.text();
+        if (!res.ok) {
+          let message = 'No se pudo exportar el reporte';
+          try { message = JSON.parse(text).error || message; } catch {}
+          throw new Error(message);
+        }
+        const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'itti-pilot-report.csv';
+        link.click();
+        URL.revokeObjectURL(link.href);
+      } catch (err) {
+        document.getElementById('importResult').textContent = err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Exportar reporte';
       }
     }
 
@@ -965,6 +1095,14 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(data));
   };
+  const sendCsv = (content, filename, status = 200) => {
+    res.writeHead(status, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store'
+    });
+    res.end(content);
+  };
 
   if (req.method === 'POST') {
     try {
@@ -1002,6 +1140,10 @@ const server = http.createServer(async (req, res) => {
         if (url.pathname === '/api/admin/import-collaborators') {
           assertAdminImportAuthorized(req);
           return sendJson(await importCollaborators(payload));
+        }
+        if (url.pathname === '/api/admin/itti-report') {
+          assertAdminImportAuthorized(req);
+          return sendCsv(await buildIttiPilotReportCsv(), 'itti-pilot-report.csv');
         }
         if (url.pathname === '/api/pos/start') {
           return sendJson(await startPoS(payload.devId));
@@ -1061,8 +1203,10 @@ export {
   assertPostRequestAllowed,
   calculateEvidenceConfidence,
   createProofOfSkillsExternalRef,
+  csvEscape,
   getDeclaredContentLength,
   normalizeHistory,
   parseCollaboratorCsv,
+  rowsToCsv,
   validateDeveloperInput
 };
