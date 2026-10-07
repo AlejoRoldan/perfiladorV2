@@ -211,6 +211,7 @@ export const posFinalEvaluationSchema = schema((value) => {
   }
 
   const skillEvaluations = [];
+  const seenSkillKeys = new Set();
   for (let index = 0; index < value.skillEvaluations.length; index++) {
     const item = value.skillEvaluations[index];
     if (!isObject(item)) return fail(['skillEvaluations', index], 'Expected an object');
@@ -219,6 +220,10 @@ export const posFinalEvaluationSchema = schema((value) => {
 
     const skillKey = asCanonicalSkillKey(item.skillKey, ['skillEvaluations', index, 'skillKey']);
     if (!skillKey.success) return skillKey;
+    if (seenSkillKeys.has(skillKey.data)) {
+      return fail(['skillEvaluations', index, 'skillKey'], `Duplicate skill key: ${skillKey.data}`);
+    }
+    seenSkillKeys.add(skillKey.data);
 
     const score = asScore(item.score, ['skillEvaluations', index, 'score']);
     if (!score.success) return score;

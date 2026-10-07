@@ -108,7 +108,10 @@ function assertPostRequestAllowed(req) {
 }
 
 function csvEscape(value) {
-  const text = String(value ?? '');
+  let text = String(value ?? '');
+  if (/^[=+\-@]/.test(text)) {
+    text = `'${text}`;
+  }
   if (/[",\r\n]/.test(text)) {
     return `"${text.replaceAll('"', '""')}"`;
   }
@@ -144,6 +147,9 @@ function createProofOfSkillsExternalRef(devId, history, now = new Date()) {
 
 function calculateEvidenceConfidence(history, skillEvaluationCount) {
   const normalizedHistory = normalizeHistory(history);
+  const distinctSkillCount = Array.isArray(skillEvaluationCount)
+    ? new Set(skillEvaluationCount.map(item => normalizeText(item?.skillKey).toUpperCase()).filter(Boolean)).size
+    : Number(skillEvaluationCount || 0);
   const userTurns = normalizedHistory.filter(item => item.role === 'user').length;
   const userTextLength = normalizedHistory
     .filter(item => item.role === 'user')
@@ -151,7 +157,7 @@ function calculateEvidenceConfidence(history, skillEvaluationCount) {
 
   const turnScore = Math.min(userTurns, 4) * 0.07;
   const depthScore = Math.min(userTextLength / 1200, 1) * 0.14;
-  const breadthScore = Math.min(Number(skillEvaluationCount || 0), 4) * 0.04;
+  const breadthScore = Math.min(distinctSkillCount, 4) * 0.04;
   const confidence = 0.5 + turnScore + depthScore + breadthScore;
   return Number(Math.min(0.95, Math.max(0.55, confidence)).toFixed(2));
 }
@@ -343,6 +349,7 @@ async function registerDeveloper(input) {
         target_seniority = EXCLUDED.target_seniority,
         tech_track = EXCLUDED.tech_track,
         updated_at = now()
+    WHERE developers.org_id = EXCLUDED.org_id
     RETURNING id, email, current_seniority, target_seniority, tech_track
   `, [
     orgRes.rows[0].id,
@@ -352,6 +359,9 @@ async function registerDeveloper(input) {
     devInput.targetSeniority,
     devInput.techTrack
   ]);
+  if (!devRes.rows.length) {
+    throw new Error('El correo ya existe en otra organizacion; no se puede mover entre organizaciones');
+  }
 
   const dev = devRes.rows[0];
   const skillsRes = await query('SELECT skill_key FROM skill_taxonomy');
@@ -421,6 +431,7 @@ async function buildIttiPilotReportRows() {
         ROUND(AVG(dsm.gap_vs_target)::numeric, 2) AS avg_gap,
         MIN(dsm.gap_vs_target) AS worst_gap
       FROM developer_skill_matrix dsm
+      WHERE dsm.confidence_score > 0.5
       GROUP BY dsm.developer_id
     ),
     pos_summary AS (
@@ -554,7 +565,7 @@ Responde solo JSON:
 
   const verdict = await askGemini(prompt, posFinalEvaluationSchema, 'PoS final evaluation');
   const externalRef = createProofOfSkillsExternalRef(dev.id, history);
-  const confidenceScore = calculateEvidenceConfidence(history, verdict.skillEvaluations.length);
+  const confidenceScore = calculateEvidenceConfidence(history, verdict.skillEvaluations);
   const audit = {
     turns: history.length,
     userTurns: normalizeHistory(history).filter(item => item.role === 'user').length,
@@ -1114,18 +1125,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     let body = '';
-    let bodyTooLarge = false;
+    let receivedBytes = 0;
+    let requestRejected = false;
     req.on('data', chunk => {
-      if (bodyTooLarge) return;
-      body += chunk;
-      if (Buffer.byteLength(body, 'utf8') > MAX_REQUEST_BODY_BYTES) {
-        bodyTooLarge = true;
+      if (requestRejected) return;
+      receivedBytes += chunk.length;
+      if (receivedBytes > MAX_REQUEST_BODY_BYTES) {
+        requestRejected = true;
         body = '';
+        sendJson({ error: 'Solicitud demasiado grande' }, 413);
+        req.destroy();
+        return;
       }
+      body += chunk;
     });
     req.on('end', async () => {
       try {
-        if (bodyTooLarge) return sendJson({ error: 'Solicitud demasiado grande' }, 413);
+        if (requestRejected) return;
         let payload;
         try {
           payload = JSON.parse(body || '{}');

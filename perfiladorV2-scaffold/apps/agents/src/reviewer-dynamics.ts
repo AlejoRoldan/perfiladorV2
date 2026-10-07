@@ -31,19 +31,27 @@ export interface ReviewerDynamicsInput {
 
 // Mapeador de seguridad para normalizar variantes comunes que pueda devolver la IA
 const SKILL_ALIASES: Record<string, string> = {
-  CODE_REVIEW: 'CODE_REVIEW_PEDAGOGY',
-  PEDAGOGY: 'CODE_REVIEW_PEDAGOGY',
-  EMPATHY: 'CODE_REVIEW_PEDAGOGY',
-  CONCURRENCY: 'CONCURRENCY_ASYNC',
-  ASYNC: 'CONCURRENCY_ASYNC',
+  CODE_REVIEW: 'CODE_REVIEW_RIGOR',
+  CODE_REVIEW_PEDAGOGY: 'CODE_REVIEW_RIGOR',
+  PEDAGOGY: 'CODE_REVIEW_RIGOR',
+  EMPATHY: 'CODE_REVIEW_RIGOR',
+  CONCURRENCY: 'SQL_OPTIMIZATION_CONCURRENCY',
+  CONCURRENCY_ASYNC: 'SQL_OPTIMIZATION_CONCURRENCY',
+  ASYNC: 'SQL_OPTIMIZATION_CONCURRENCY',
   ARCHITECTURE: 'CLEAN_ARCHITECTURE',
   SOLID: 'CLEAN_ARCHITECTURE',
-  CLEAN_CODE: 'CODE_SIMPLICITY',
-  DATABASE: 'DATABASE_OPTIMIZATION',
-  ACID: 'DATABASE_OPTIMIZATION',
-  SECURITY: 'API_DESIGN_SECURITY',
-  TESTING: 'TESTING_STRATEGIES',
-  DOCUMENTATION: 'TECHNICAL_DOCUMENTATION'
+  CODE_SIMPLICITY: 'CLEAN_ARCHITECTURE',
+  CLEAN_CODE: 'CLEAN_ARCHITECTURE',
+  DATABASE: 'SQL_OPTIMIZATION_CONCURRENCY',
+  DATABASE_OPTIMIZATION: 'SQL_OPTIMIZATION_CONCURRENCY',
+  ACID: 'SQL_OPTIMIZATION_CONCURRENCY',
+  SECURITY: 'OWASP_INPUT_VALIDATION',
+  API_DESIGN_SECURITY: 'OWASP_INPUT_VALIDATION',
+  TESTING: 'TESTING_STRATEGY',
+  TESTING_STRATEGIES: 'TESTING_STRATEGY',
+  DOCUMENTATION: 'API_CONTRACTS',
+  TECHNICAL_DOCUMENTATION: 'API_CONTRACTS',
+  SYSTEM_DESIGN_RESILIENCE: 'SYSTEM_DESIGN_SCALABILITY'
 };
 
 export class ReviewerDynamicsAgent {
@@ -89,22 +97,20 @@ ${sanitizedComments}
 \`\`\`
 
 Evalúa las dimensiones de revisión de código:
-1. CODE_REVIEW_PEDAGOGY: ¿El feedback es claro, explicativo, respetuoso y pedagógico? ¿Enseña el "por qué" o es tajante/punitivo?
+1. CODE_REVIEW_RIGOR: ¿El feedback es claro, explicativo, respetuoso y pedagógico? ¿Enseña el "por qué" y detecta riesgos reales?
 2. Rigor Técnico: ¿Identificó problemas de fondo (arquitectura, seguridad, concurrencia, casos borde) o solo detalles cosméticos de estilo?
 3. Accionabilidad: ¿Aportó sugerencias de código concretas o alternativas viables?
 
 REGLA ESTRICTA DE TAXONOMÍA:
 En "skillEvaluations", el campo "skillKey" DEBE pertenecer obligatoriamente a esta lista oficial:
-- "CODE_REVIEW_PEDAGOGY" (Dimensión principal obligatoria)
-- "CONCURRENCY_ASYNC"
+- "CODE_REVIEW_RIGOR" (Dimensión principal obligatoria)
+- "SQL_OPTIMIZATION_CONCURRENCY"
 - "CLEAN_ARCHITECTURE"
-- "DATABASE_OPTIMIZATION"
-- "TESTING_STRATEGIES"
-- "DEFENSIVE_PROGRAMMING"
-- "CODE_SIMPLICITY"
-- "API_DESIGN_SECURITY"
-- "TECHNICAL_DOCUMENTATION"
-- "SYSTEM_DESIGN_RESILIENCE"
+- "SYSTEM_DESIGN_SCALABILITY"
+- "OWASP_INPUT_VALIDATION"
+- "TESTING_STRATEGY"
+- "OBSERVABILITY_INCIDENTS"
+- "API_CONTRACTS"
 
 Debes responder ÚNICAMENTE en formato JSON válido con este esquema:
 {
@@ -112,7 +118,7 @@ Debes responder ÚNICAMENTE en formato JSON válido con este esquema:
   "overallScore": 4.5,
   "skillEvaluations": [
     {
-      "skillKey": "CODE_REVIEW_PEDAGOGY",
+      "skillKey": "CODE_REVIEW_RIGOR",
       "score": 4.7,
       "feedback": "Justificación sobre la pedagogía y empatía observada",
       "evidenceSnippet": "Fragmento del comentario que demuestra esta cualidad"
@@ -171,7 +177,7 @@ Nota: Las notas van de 1.0 a 5.0.`;
 
     // Obtener las claves canónicas registradas en Supabase
     const validSkills = await db.select({ key: skillTaxonomy.skillKey }).from(skillTaxonomy);
-    const validSkillSet = new Set(validSkills.map((s) => s.key));
+    const validSkillSet = new Set(validSkills.map((s: { key: string }) => s.key));
 
     // A. Guardar la señal inmutable
     const [signal] = await db.insert(evaluationSignals).values({

