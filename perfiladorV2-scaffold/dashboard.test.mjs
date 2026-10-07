@@ -11,9 +11,11 @@ const {
   assertPostRequestAllowed,
   calculateEvidenceConfidence,
   createProofOfSkillsExternalRef,
+  csvEscape,
   getDeclaredContentLength,
   normalizeHistory,
   parseCollaboratorCsv,
+  rowsToCsv,
   validateDeveloperInput
 } = await import('./dashboard.mjs');
 
@@ -164,4 +166,40 @@ test('POST requests reject oversized declared bodies before parsing', () => {
     }),
     error => error instanceof HttpError && error.statusCode === 413
   );
+});
+
+test('pilot report CSV escapes values and uses safe export columns', () => {
+  const headers = [
+    'email',
+    'pos_status',
+    'last_external_ref',
+    'avg_score',
+    'completed_modules'
+  ];
+  const csv = rowsToCsv(headers, [{
+    email: 'ana.gomez@itti.digital',
+    pos_status: 'COMPLETED',
+    last_external_ref: 'POS-20261007-123456789-abcdef1234567890',
+    avg_score: 4.25,
+    completed_modules: 1,
+    raw_evaluations: '{"prompt":"secret"}'
+  }, {
+    email: 'bruno,rios@itti.digital',
+    pos_status: 'PENDING',
+    last_external_ref: '',
+    avg_score: 0,
+    completed_modules: 0
+  }]);
+
+  assert.equal(csv.includes('raw_evaluations'), false);
+  assert.equal(csv.includes('secret'), false);
+  assert.equal(csv.split('\r\n')[0], headers.join(','));
+  assert.match(csv, /"bruno,rios@itti\.digital",PENDING/);
+});
+
+test('CSV escaping protects quotes and newlines', () => {
+  assert.equal(csvEscape('plain'), 'plain');
+  assert.equal(csvEscape('a,b'), '"a,b"');
+  assert.equal(csvEscape('a"b'), '"a""b"');
+  assert.equal(csvEscape('a\nb'), '"a\nb"');
 });
