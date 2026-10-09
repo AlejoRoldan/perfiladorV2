@@ -34,6 +34,58 @@ const normalizeEmail = value => normalizeText(value).toLowerCase();
 const normalizeOrgSlug = value => normalizeText(value).toLowerCase();
 const PILOT_IMPORT_ORG_SLUG = normalizeOrgSlug(process.env.PILOT_IMPORT_ORG_SLUG || 'itti');
 const ADMIN_IMPORT_TOKEN = normalizeText(process.env.ADMIN_IMPORT_TOKEN || '');
+const LLM_REDACTION_RULES = Object.freeze([
+  {
+    name: 'PRIVATE_KEY',
+    pattern: /-----BEGIN[ A-Z_-]*PRIVATE KEY-----[\s\S]*?-----END[ A-Z_-]*PRIVATE KEY-----/gi,
+    replacement: '[REDACTED_PRIVATE_KEY]'
+  },
+  {
+    name: 'DATABASE_CONNECTION_STRING',
+    pattern: /(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql):\/\/[^\s"'`]+/gi,
+    replacement: '[REDACTED_DB_CONNECTION_STRING]'
+  },
+  {
+    name: 'GOOGLE_API_KEY',
+    pattern: /AIzaSy[0-9A-Za-z_-]{30,40}/g,
+    replacement: '[REDACTED_GOOGLE_API_KEY]'
+  },
+  {
+    name: 'OPENAI_API_KEY',
+    pattern: /sk-(?:proj-)?[A-Za-z0-9_-]{20,}/g,
+    replacement: '[REDACTED_OPENAI_API_KEY]'
+  },
+  {
+    name: 'SUPABASE_SECRET_KEY',
+    pattern: /sb_secret_[A-Za-z0-9_-]{20,}/g,
+    replacement: '[REDACTED_SUPABASE_SECRET_KEY]'
+  },
+  {
+    name: 'JWT_TOKEN',
+    pattern: /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+    replacement: '[REDACTED_JWT_TOKEN]'
+  },
+  {
+    name: 'BEARER_AUTH',
+    pattern: /Bearer\s+[A-Za-z0-9_\-\.+=]{20,}/gi,
+    replacement: 'Bearer [REDACTED_BEARER_TOKEN]'
+  },
+  {
+    name: 'JSON_ASSIGNED_SECRET',
+    pattern: /(["'])(api[_-]?key|secret|password|passwd|auth[_-]?token|access[_-]?token|private[_-]?key)(["']\s*:\s*["'])([^"']{8,})(["'])/gi,
+    replacement: '$1$2$3[REDACTED_SECRET]$5'
+  },
+  {
+    name: 'ENV_ASSIGNED_SECRET',
+    pattern: /(^|[\s;])([A-Z0-9_]*(?:API[_-]?KEY|SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE[_-]?KEY)[A-Z0-9_]*)(\s*=\s*)(["']?)([^\s"'`;]{8,})(["']?)/gim,
+    replacement: '$1$2$3$4[REDACTED_SECRET]$6'
+  },
+  {
+    name: 'EMAIL_ADDRESS',
+    pattern: /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
+    replacement: '[REDACTED_EMAIL]'
+  }
+]);
 const escapeHtml = value => String(value ?? '')
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -53,6 +105,44 @@ function getBearerToken(req) {
   const authorization = normalizeText(req.headers.authorization || '');
   const match = authorization.match(/^Bearer\s+(.+)$/i);
   return match ? normalizeText(match[1]) : '';
+}
+
+function applyReplacement(template, args) {
+  if (typeof template === 'function') return template(...args);
+  if (!String(template).includes('$')) return template;
+  let output = template;
+  for (let i = 1; i <= 6; i++) {
+    output = output.replaceAll(`$${i}`, args[i] || '');
+  }
+  return output;
+}
+
+function sanitizeLlmText(value) {
+  let sanitized = String(value ?? '');
+  let redactedCount = 0;
+  for (const rule of LLM_REDACTION_RULES) {
+    sanitized = sanitized.replace(rule.pattern, (...args) => {
+      redactedCount++;
+      return applyReplacement(rule.replacement, args);
+    });
+  }
+  return { sanitized, hasRedactions: redactedCount > 0, redactedCount };
+}
+
+function sanitizeLlmHistory(history) {
+  return normalizeHistory(history).map(item => ({
+    role: item.role,
+    message: sanitizeLlmText(item.message).sanitized
+  }));
+}
+
+function createParticipantPromptLabel(dev) {
+  const hash = crypto
+    .createHash('sha256')
+    .update(normalizeText(dev?.id || dev?.email || 'unknown'))
+    .digest('hex')
+    .slice(0, 10);
+  return `colaborador-${hash}`;
 }
 
 function assertAdminImportAuthorized(req) {
@@ -163,11 +253,12 @@ function calculateEvidenceConfidence(history, skillEvaluationCount) {
 }
 
 async function askGemini(prompt, schema, label) {
+  const safePrompt = sanitizeLlmText(prompt).sanitized;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await ai.models.generateContent({
         model: GEMINI_MODEL,
-        contents: prompt,
+        contents: safePrompt,
         config: { responseMimeType: 'application/json' }
       });
       return parseJsonWithSchema(res.text, schema, label);
@@ -506,10 +597,11 @@ async function buildIttiPilotReportCsv() {
 async function startPoS(devId) {
   const dev = await getDeveloper(devId);
   if (!dev) throw new Error('No hay colaborador seleccionado');
+  const participantLabel = createParticipantPromptLabel(dev);
 
   const prompt = `
-Eres el Staff Principal Architect de ${dev.org_name}.
-Inicia una sesion de Proof of Skills con ${dev.email.split('@')[0]}.
+Eres el Staff Principal Architect de una organizacion piloto.
+Inicia una sesion de Proof of Skills con ${participantLabel}.
 Perfil: nivel actual ${dev.current_seniority}, meta ${dev.target_seniority}, track ${dev.tech_track}.
 Plantea una primera pregunta desafiante sobre un caso real de ingenieria: concurrencia, ACID, microservicios, resiliencia u observabilidad.
 Responde solo JSON:
@@ -521,16 +613,19 @@ Responde solo JSON:
 async function chatPoS(devId, history, userResponse) {
   const dev = await getDeveloper(devId);
   if (!dev) throw new Error('No hay colaborador seleccionado');
+  const participantLabel = createParticipantPromptLabel(dev);
+  const safeHistory = sanitizeLlmHistory(history);
+  const safeUserResponse = sanitizeLlmText(userResponse).sanitized;
 
   const prompt = `
-Eres el Staff Principal Architect de ${dev.org_name} evaluando a ${dev.email.split('@')[0]}.
+Eres el Staff Principal Architect de una organizacion piloto evaluando a ${participantLabel}.
 Track: ${dev.tech_track}. Meta: ${dev.target_seniority}.
 
 Historial:
-${JSON.stringify(history, null, 2)}
+${JSON.stringify(safeHistory, null, 2)}
 
 Ultima respuesta:
-"${userResponse}"
+"${safeUserResponse}"
 
 Evalua fortalezas y vacios tecnicos. Plantea una pregunta de seguimiento sobre trade-offs, escalabilidad, seguridad u operacion.
 Responde solo JSON:
@@ -542,14 +637,16 @@ Responde solo JSON:
 async function finishPoS(devId, history) {
   const dev = await getDeveloper(devId);
   if (!dev) throw new Error('No hay colaborador seleccionado');
+  const participantLabel = createParticipantPromptLabel(dev);
+  const safeHistory = sanitizeLlmHistory(history);
 
   const rubrics = await query('SELECT skill_key, display_name, rubric_levels FROM skill_taxonomy');
   const prompt = `
-Evalua esta transcripcion tecnica de Proof of Skills para ${dev.email}.
+Evalua esta transcripcion tecnica de Proof of Skills para ${participantLabel}.
 Meta: ${dev.target_seniority}. Track: ${dev.tech_track}.
 
 Transcripcion:
-${JSON.stringify(history, null, 2)}
+${JSON.stringify(safeHistory, null, 2)}
 
 Rubricas:
 ${JSON.stringify(rubrics.rows, null, 2)}
@@ -1224,5 +1321,7 @@ export {
   normalizeHistory,
   parseCollaboratorCsv,
   rowsToCsv,
+  sanitizeLlmHistory,
+  sanitizeLlmText,
   validateDeveloperInput
 };

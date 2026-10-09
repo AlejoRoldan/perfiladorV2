@@ -16,6 +16,8 @@ const {
   normalizeHistory,
   parseCollaboratorCsv,
   rowsToCsv,
+  sanitizeLlmHistory,
+  sanitizeLlmText,
   validateDeveloperInput
 } = await import('./dashboard.mjs');
 
@@ -129,6 +131,37 @@ test('history normalization removes empty or malformed turns', () => {
     null
   ]), [
     { role: 'user', message: 'respuesta' }
+  ]);
+});
+
+test('LLM sanitizer removes emails and secrets from prompt context', () => {
+  const input = `
+ana.gomez@itti.digital
+DATABASE_URL=postgresql://postgres:supersecret@db.example.com:6543/postgres
+{"password":"plain-text-secret","api_key":"sb_secret_abcdefghijklmnopqrstuvwxyz123456"}
+Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturetoken
+`;
+  const result = sanitizeLlmText(input);
+
+  assert.equal(result.hasRedactions, true);
+  assert.equal(result.sanitized.includes('ana.gomez@itti.digital'), false);
+  assert.equal(result.sanitized.includes('supersecret'), false);
+  assert.equal(result.sanitized.includes('plain-text-secret'), false);
+  assert.equal(result.sanitized.includes('sb_secret_'), false);
+  assert.match(result.sanitized, /\[REDACTED_EMAIL\]/);
+  assert.match(result.sanitized, /\[REDACTED_DB_CONNECTION_STRING\]/);
+});
+
+test('LLM history sanitizer preserves roles and redacts user content', () => {
+  const history = sanitizeLlmHistory([
+    { role: 'user', message: 'Mi correo es ana.gomez@itti.digital y PASSWORD=topsecretvalue' },
+    { role: 'agent', message: 'Pregunta de seguimiento' },
+    { role: '', message: 'ignorar' }
+  ]);
+
+  assert.deepEqual(history, [
+    { role: 'user', message: 'Mi correo es [REDACTED_EMAIL] y PASSWORD=[REDACTED_SECRET]' },
+    { role: 'agent', message: 'Pregunta de seguimiento' }
   ]);
 });
 
