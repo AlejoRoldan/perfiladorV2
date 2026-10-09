@@ -224,6 +224,49 @@ function normalizeHistory(history) {
     : [];
 }
 
+function requirePoSDevId(devId) {
+  const normalized = normalizeText(devId);
+  if (!normalized) {
+    throw new HttpError('devId es obligatorio para Proof of Skills', 400);
+  }
+  return normalized;
+}
+
+function validatePoSHistory(history, { minUserTurns = 1, requireLastUser = false } = {}) {
+  if (!Array.isArray(history)) {
+    throw new HttpError('Transcripcion invalida: se esperaba un historial', 400);
+  }
+
+  const normalized = normalizeHistory(history);
+  if (normalized.length !== history.length || normalized.length === 0) {
+    throw new HttpError('Transcripcion invalida: contiene turnos vacios o malformados', 400);
+  }
+
+  for (const item of normalized) {
+    if (!['agent', 'user'].includes(item.role)) {
+      throw new HttpError('Transcripcion invalida: rol no permitido', 400);
+    }
+    if (item.message.length > 4000) {
+      throw new HttpError('Transcripcion invalida: turno demasiado largo', 413);
+    }
+  }
+
+  if (normalized[0].role !== 'agent') {
+    throw new HttpError('Transcripcion invalida: debe iniciar con una pregunta del agente', 400);
+  }
+
+  const userTurns = normalized.filter(item => item.role === 'user').length;
+  const agentTurns = normalized.filter(item => item.role === 'agent').length;
+  if (userTurns < minUserTurns || agentTurns < 1) {
+    throw new HttpError('Transcripcion insuficiente para evaluar Proof of Skills', 400);
+  }
+  if (requireLastUser && normalized.at(-1)?.role !== 'user') {
+    throw new HttpError('Transcripcion invalida: debe cerrar con una respuesta del colaborador', 400);
+  }
+
+  return normalized;
+}
+
 function createProofOfSkillsExternalRef(devId, history, now = new Date()) {
   const normalizedHistory = normalizeHistory(history);
   const timestamp = now.toISOString().replace(/[-:.]/g, '').replace('T', '-').replace('Z', '');
@@ -291,6 +334,15 @@ async function getDeveloper(devId = null) {
     LIMIT 1
   `);
   return latest.rows[0] || null;
+}
+
+async function getRequiredDeveloper(devId) {
+  const requiredDevId = requirePoSDevId(devId);
+  const dev = await getDeveloper(requiredDevId);
+  if (!dev || dev.id !== requiredDevId) {
+    throw new HttpError('Colaborador no encontrado para Proof of Skills', 404);
+  }
+  return dev;
 }
 
 async function getDashboardData(devId = null) {
@@ -595,8 +647,7 @@ async function buildIttiPilotReportCsv() {
 }
 
 async function startPoS(devId) {
-  const dev = await getDeveloper(devId);
-  if (!dev) throw new Error('No hay colaborador seleccionado');
+  const dev = await getRequiredDeveloper(devId);
   const participantLabel = createParticipantPromptLabel(dev);
 
   const prompt = `
@@ -611,11 +662,18 @@ Responde solo JSON:
 }
 
 async function chatPoS(devId, history, userResponse) {
-  const dev = await getDeveloper(devId);
-  if (!dev) throw new Error('No hay colaborador seleccionado');
+  const dev = await getRequiredDeveloper(devId);
+  const normalizedHistory = validatePoSHistory(history, { minUserTurns: 0 });
+  const normalizedUserResponse = normalizeText(userResponse);
+  if (!normalizedUserResponse) {
+    throw new HttpError('Respuesta vacia para Proof of Skills', 400);
+  }
+  if (normalizedUserResponse.length > 4000) {
+    throw new HttpError('Respuesta demasiado larga para Proof of Skills', 413);
+  }
   const participantLabel = createParticipantPromptLabel(dev);
-  const safeHistory = sanitizeLlmHistory(history);
-  const safeUserResponse = sanitizeLlmText(userResponse).sanitized;
+  const safeHistory = sanitizeLlmHistory(normalizedHistory);
+  const safeUserResponse = sanitizeLlmText(normalizedUserResponse).sanitized;
 
   const prompt = `
 Eres el Staff Principal Architect de una organizacion piloto evaluando a ${participantLabel}.
@@ -635,10 +693,10 @@ Responde solo JSON:
 }
 
 async function finishPoS(devId, history) {
-  const dev = await getDeveloper(devId);
-  if (!dev) throw new Error('No hay colaborador seleccionado');
+  const dev = await getRequiredDeveloper(devId);
+  const normalizedHistory = validatePoSHistory(history, { minUserTurns: 1 });
   const participantLabel = createParticipantPromptLabel(dev);
-  const safeHistory = sanitizeLlmHistory(history);
+  const safeHistory = sanitizeLlmHistory(normalizedHistory);
 
   const rubrics = await query('SELECT skill_key, display_name, rubric_levels FROM skill_taxonomy');
   const prompt = `
@@ -661,11 +719,11 @@ Responde solo JSON:
 }`;
 
   const verdict = await askGemini(prompt, posFinalEvaluationSchema, 'PoS final evaluation');
-  const externalRef = createProofOfSkillsExternalRef(dev.id, history);
-  const confidenceScore = calculateEvidenceConfidence(history, verdict.skillEvaluations);
+  const externalRef = createProofOfSkillsExternalRef(dev.id, normalizedHistory);
+  const confidenceScore = calculateEvidenceConfidence(normalizedHistory, verdict.skillEvaluations);
   const audit = {
-    turns: history.length,
-    userTurns: normalizeHistory(history).filter(item => item.role === 'user').length,
+    turns: normalizedHistory.length,
+    userTurns: normalizedHistory.filter(item => item.role === 'user').length,
     model: GEMINI_MODEL,
     promptFamily: 'proof-of-skills-interview',
     schemaVersion: SCHEMA_VERSION,
@@ -1320,8 +1378,10 @@ export {
   getDeclaredContentLength,
   normalizeHistory,
   parseCollaboratorCsv,
+  requirePoSDevId,
   rowsToCsv,
   sanitizeLlmHistory,
   sanitizeLlmText,
+  validatePoSHistory,
   validateDeveloperInput
 };
