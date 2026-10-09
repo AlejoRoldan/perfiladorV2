@@ -101,6 +101,25 @@ class HttpError extends Error {
   }
 }
 
+async function withTransaction(work) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Dashboard transaction rollback failed:', rollbackErr);
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 function getBearerToken(req) {
   const authorization = normalizeText(req.headers.authorization || '');
   const match = authorization.match(/^Bearer\s+(.+)$/i);
@@ -265,6 +284,21 @@ function validatePoSHistory(history, { minUserTurns = 1, requireLastUser = false
   }
 
   return normalized;
+}
+
+function assertSkillEvaluationsInTaxonomy(skillEvaluations, taxonomyRows) {
+  const taxonomyKeys = new Set((taxonomyRows || []).map(row => normalizeText(row.skill_key).toUpperCase()).filter(Boolean));
+  if (!taxonomyKeys.size) {
+    throw new HttpError('Taxonomia no disponible para Proof of Skills', 503);
+  }
+
+  const unknown = (skillEvaluations || [])
+    .map(item => normalizeText(item?.skillKey).toUpperCase())
+    .filter(skillKey => !taxonomyKeys.has(skillKey));
+
+  if (unknown.length) {
+    throw new HttpError(`Skill fuera de taxonomia activa: ${unknown[0]}`, 422);
+  }
 }
 
 function createProofOfSkillsExternalRef(devId, history, now = new Date()) {
@@ -719,6 +753,7 @@ Responde solo JSON:
 }`;
 
   const verdict = await askGemini(prompt, posFinalEvaluationSchema, 'PoS final evaluation');
+  assertSkillEvaluationsInTaxonomy(verdict.skillEvaluations, rubrics.rows);
   const externalRef = createProofOfSkillsExternalRef(dev.id, normalizedHistory);
   const confidenceScore = calculateEvidenceConfidence(normalizedHistory, verdict.skillEvaluations);
   const audit = {
@@ -732,31 +767,33 @@ Responde solo JSON:
     confidenceScore
   };
 
-  await query(`
-    INSERT INTO evaluation_signals (developer_id, source_type, external_ref, diff_summary, raw_evaluations)
-    VALUES ($1, 'CONVERSATIONAL_PROOF_OF_SKILL', $2, $3, $4)
-  `, [dev.id, externalRef, JSON.stringify(audit), JSON.stringify({ ...verdict, audit })]);
+  await withTransaction(async client => {
+    await client.query(`
+      INSERT INTO evaluation_signals (developer_id, source_type, external_ref, diff_summary, raw_evaluations)
+      VALUES ($1, 'CONVERSATIONAL_PROOF_OF_SKILL', $2, $3, $4)
+    `, [dev.id, externalRef, JSON.stringify(audit), JSON.stringify({ ...verdict, audit })]);
 
-  for (const item of verdict.skillEvaluations) {
-    const bench = await query(`
-      SELECT required_score
-      FROM seniority_benchmarks
-      WHERE track = $1 AND seniority_level = $2 AND skill_key = $3
-    `, [dev.tech_track, dev.target_seniority, item.skillKey]);
-    const required = Number(bench.rows[0]?.required_score || 3.5);
-    const gap = Number(item.score) - required;
+    for (const item of verdict.skillEvaluations) {
+      const bench = await client.query(`
+        SELECT required_score
+        FROM seniority_benchmarks
+        WHERE track = $1 AND seniority_level = $2 AND skill_key = $3
+      `, [dev.tech_track, dev.target_seniority, item.skillKey]);
+      const required = Number(bench.rows[0]?.required_score || 3.5);
+      const gap = Number(item.score) - required;
 
-    await query(`
-      INSERT INTO developer_skill_matrix (developer_id, skill_key, current_score, confidence_score, last_signal_at, gap_vs_target)
-      VALUES ($1, $2, $3, $4, now(), $5)
-      ON CONFLICT (developer_id, skill_key) DO UPDATE
-      SET current_score = EXCLUDED.current_score,
-          confidence_score = EXCLUDED.confidence_score,
-          last_signal_at = now(),
-          gap_vs_target = EXCLUDED.gap_vs_target,
-          updated_at = now()
-    `, [dev.id, item.skillKey, item.score, confidenceScore, gap]);
-  }
+      await client.query(`
+        INSERT INTO developer_skill_matrix (developer_id, skill_key, current_score, confidence_score, last_signal_at, gap_vs_target)
+        VALUES ($1, $2, $3, $4, now(), $5)
+        ON CONFLICT (developer_id, skill_key) DO UPDATE
+        SET current_score = EXCLUDED.current_score,
+            confidence_score = EXCLUDED.confidence_score,
+            last_signal_at = now(),
+            gap_vs_target = EXCLUDED.gap_vs_target,
+            updated_at = now()
+      `, [dev.id, item.skillKey, item.score, confidenceScore, gap]);
+    }
+  });
 
   return { ...verdict, audit };
 }
@@ -1369,6 +1406,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   HttpError,
+  assertSkillEvaluationsInTaxonomy,
   assertAdminImportAuthorized,
   assertAllowedPostOrigin,
   assertPostRequestAllowed,
