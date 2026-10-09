@@ -15,9 +15,11 @@ const {
   getDeclaredContentLength,
   normalizeHistory,
   parseCollaboratorCsv,
+  requirePoSDevId,
   rowsToCsv,
   sanitizeLlmHistory,
   sanitizeLlmText,
+  validatePoSHistory,
   validateDeveloperInput
 } = await import('./dashboard.mjs');
 
@@ -162,6 +164,49 @@ test('LLM history sanitizer preserves roles and redacts user content', () => {
   assert.deepEqual(history, [
     { role: 'user', message: 'Mi correo es [REDACTED_EMAIL] y PASSWORD=[REDACTED_SECRET]' },
     { role: 'agent', message: 'Pregunta de seguimiento' }
+  ]);
+});
+
+test('Proof of Skills requires explicit devId', () => {
+  assert.equal(requirePoSDevId(' dev-123 '), 'dev-123');
+  assert.throws(
+    () => requirePoSDevId(''),
+    error => error instanceof HttpError && error.statusCode === 400
+  );
+  assert.throws(
+    () => requirePoSDevId(null),
+    error => error instanceof HttpError && error.statusCode === 400
+  );
+});
+
+test('Proof of Skills transcript validation rejects empty or malformed evidence', () => {
+  assert.throws(
+    () => validatePoSHistory([], { minUserTurns: 1 }),
+    error => error instanceof HttpError && error.statusCode === 400
+  );
+  assert.throws(
+    () => validatePoSHistory([{ role: 'user', message: 'Arranco sin pregunta' }], { minUserTurns: 1 }),
+    /debe iniciar/
+  );
+  assert.throws(
+    () => validatePoSHistory([{ role: 'agent', message: 'Pregunta' }], { minUserTurns: 1 }),
+    /insuficiente/
+  );
+  assert.throws(
+    () => validatePoSHistory([{ role: 'system', message: 'fake' }], { minUserTurns: 0 }),
+    /rol no permitido/
+  );
+});
+
+test('Proof of Skills transcript validation returns normalized valid evidence', () => {
+  assert.deepEqual(validatePoSHistory([
+    { role: 'agent', message: ' Pregunta ' },
+    { role: 'user', message: ' Respuesta con evidencia ' },
+    { role: 'agent', message: ' Seguimiento ' }
+  ], { minUserTurns: 1 }), [
+    { role: 'agent', message: 'Pregunta' },
+    { role: 'user', message: 'Respuesta con evidencia' },
+    { role: 'agent', message: 'Seguimiento' }
   ]);
 });
 
