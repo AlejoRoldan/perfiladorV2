@@ -6,6 +6,7 @@ process.env.PILOT_IMPORT_ORG_SLUG = 'itti';
 
 const {
   HttpError,
+  assertSkillEvaluationsInTaxonomy,
   assertAdminImportAuthorized,
   assertAllowedPostOrigin,
   assertPostRequestAllowed,
@@ -208,6 +209,32 @@ test('Proof of Skills transcript validation returns normalized valid evidence', 
     { role: 'user', message: 'Respuesta con evidencia' },
     { role: 'agent', message: 'Seguimiento' }
   ]);
+});
+
+test('Proof of Skills rejects skill evaluations outside active taxonomy', () => {
+  const taxonomy = [
+    { skill_key: 'CLEAN_ARCHITECTURE' },
+    { skill_key: 'TESTING_STRATEGY' }
+  ];
+
+  assert.doesNotThrow(() => assertSkillEvaluationsInTaxonomy([
+    { skillKey: 'CLEAN_ARCHITECTURE', score: 4.1 },
+    { skillKey: 'testing_strategy', score: 3.8 }
+  ], taxonomy));
+
+  assert.throws(
+    () => assertSkillEvaluationsInTaxonomy([
+      { skillKey: 'SQL_OPTIMIZATION_CONCURRENCY', score: 4.2 }
+    ], taxonomy),
+    error => error instanceof HttpError && error.statusCode === 422
+  );
+
+  assert.throws(
+    () => assertSkillEvaluationsInTaxonomy([
+      { skillKey: 'CLEAN_ARCHITECTURE', score: 4.1 }
+    ], []),
+    error => error instanceof HttpError && error.statusCode === 503
+  );
 });
 
 test('POST requests reject text/plain and require JSON content type', () => {
