@@ -10,12 +10,39 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function asScore(value, path) {
-  const score = Number(value);
-  if (!Number.isFinite(score) || score < 1 || score > 5) {
-    return fail(path, 'Expected a number from 1 to 5');
+export const CANONICAL_SKILL_KEYS = Object.freeze([
+  'CLEAN_ARCHITECTURE',
+  'SYSTEM_DESIGN_SCALABILITY',
+  'SQL_OPTIMIZATION_CONCURRENCY',
+  'OWASP_INPUT_VALIDATION',
+  'TESTING_STRATEGY',
+  'OBSERVABILITY_INCIDENTS',
+  'API_CONTRACTS',
+  'CODE_REVIEW_RIGOR'
+]);
+
+const CANONICAL_SKILL_KEY_SET = new Set(CANONICAL_SKILL_KEYS);
+
+function assertKnownKeys(value, allowedKeys, path) {
+  const unexpected = Object.keys(value).filter(key => !allowedKeys.includes(key));
+  if (unexpected.length) {
+    return fail(path.concat(unexpected[0]), `Unexpected field: ${unexpected[0]}`);
   }
-  return ok(score);
+  return ok(value);
+}
+
+function asScore(value, path) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1 || value > 5) {
+    return fail(path, 'Expected a numeric value from 1 to 5');
+  }
+  return ok(value);
+}
+
+function asBoolean(value, path) {
+  if (typeof value !== 'boolean') {
+    return fail(path, 'Expected a boolean');
+  }
+  return ok(value);
 }
 
 function asRequiredString(value, path) {
@@ -23,6 +50,17 @@ function asRequiredString(value, path) {
     return fail(path, 'Expected a non-empty string');
   }
   return ok(value);
+}
+
+function asCanonicalSkillKey(value, path) {
+  const result = asRequiredString(value, path);
+  if (!result.success) return result;
+
+  const skillKey = result.data.trim().toUpperCase();
+  if (!CANONICAL_SKILL_KEY_SET.has(skillKey)) {
+    return fail(path, `Unknown canonical skill key: ${result.data}`);
+  }
+  return ok(skillKey);
 }
 
 function asStringArray(value, path) {
@@ -39,8 +77,10 @@ function schema(validate) {
 
 export const codeEvaluationItemSchema = schema((item) => {
   if (!isObject(item)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(item, ['skillKey', 'score', 'rationale', 'antipatterns', 'detectedAntipatterns'], []);
+  if (!knownKeys.success) return knownKeys;
 
-  const skillKey = asRequiredString(item.skillKey, ['skillKey']);
+  const skillKey = asCanonicalSkillKey(item.skillKey, ['skillKey']);
   if (!skillKey.success) return skillKey;
 
   const score = asScore(item.score, ['score']);
@@ -56,7 +96,6 @@ export const codeEvaluationItemSchema = schema((item) => {
   if (!detectedAntipatterns.success) return detectedAntipatterns;
 
   return ok({
-    ...item,
     skillKey: skillKey.data,
     score: score.data,
     rationale: rationale.data,
@@ -67,6 +106,8 @@ export const codeEvaluationItemSchema = schema((item) => {
 
 export const codeEvaluationResponseSchema = schema((value) => {
   if (!isObject(value)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(value, ['evaluations'], []);
+  if (!knownKeys.success) return knownKeys;
   if (!Array.isArray(value.evaluations) || value.evaluations.length === 0) {
     return fail(['evaluations'], 'Expected at least one evaluation');
   }
@@ -81,11 +122,13 @@ export const codeEvaluationResponseSchema = schema((value) => {
     evaluations.push(result.data);
   }
 
-  return ok({ ...value, evaluations });
+  return ok({ evaluations });
 });
 
 export const learningModuleResponseSchema = schema((value) => {
   if (!isObject(value)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(value, ['title', 'conceptExplanation', 'badPattern', 'goodPattern', 'interactiveChallenge'], []);
+  if (!knownKeys.success) return knownKeys;
   for (const key of ['title', 'conceptExplanation', 'badPattern', 'goodPattern']) {
     const result = asRequiredString(value[key], [key]);
     if (!result.success) return result;
@@ -93,15 +136,32 @@ export const learningModuleResponseSchema = schema((value) => {
   if (!isObject(value.interactiveChallenge)) {
     return fail(['interactiveChallenge'], 'Expected an object');
   }
+  const challengeKeys = assertKnownKeys(value.interactiveChallenge, ['instructions', 'starterCode', 'solutionCode'], ['interactiveChallenge']);
+  if (!challengeKeys.success) return challengeKeys;
   for (const key of ['instructions', 'starterCode', 'solutionCode']) {
     const result = asRequiredString(value.interactiveChallenge[key], ['interactiveChallenge', key]);
     if (!result.success) return result;
   }
-  return ok(value);
+  return ok({
+    title: value.title,
+    conceptExplanation: value.conceptExplanation,
+    badPattern: value.badPattern,
+    goodPattern: value.goodPattern,
+    interactiveChallenge: {
+      instructions: value.interactiveChallenge.instructions,
+      starterCode: value.interactiveChallenge.starterCode,
+      solutionCode: value.interactiveChallenge.solutionCode
+    }
+  });
 });
 
 export const challengeVerdictSchema = schema((value) => {
   if (!isObject(value)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(value, ['passed', 'score', 'feedback', 'verifiedCompetencies'], []);
+  if (!knownKeys.success) return knownKeys;
+
+  const passed = asBoolean(value.passed, ['passed']);
+  if (!passed.success) return passed;
 
   const score = asScore(value.score, ['score']);
   if (!score.success) return score;
@@ -113,8 +173,7 @@ export const challengeVerdictSchema = schema((value) => {
   if (!verifiedCompetencies.success) return verifiedCompetencies;
 
   return ok({
-    ...value,
-    passed: Boolean(value.passed),
+    passed: passed.data,
     score: score.data,
     feedback: feedback.data,
     verifiedCompetencies: verifiedCompetencies.data
@@ -123,20 +182,26 @@ export const challengeVerdictSchema = schema((value) => {
 
 export const posStartResponseSchema = schema((value) => {
   if (!isObject(value)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(value, ['welcomeMessage'], []);
+  if (!knownKeys.success) return knownKeys;
   const welcomeMessage = asRequiredString(value.welcomeMessage, ['welcomeMessage']);
   if (!welcomeMessage.success) return welcomeMessage;
-  return ok({ ...value, welcomeMessage: welcomeMessage.data });
+  return ok({ welcomeMessage: welcomeMessage.data });
 });
 
 export const posChatResponseSchema = schema((value) => {
   if (!isObject(value)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(value, ['interviewerReply'], []);
+  if (!knownKeys.success) return knownKeys;
   const interviewerReply = asRequiredString(value.interviewerReply, ['interviewerReply']);
   if (!interviewerReply.success) return interviewerReply;
-  return ok({ ...value, interviewerReply: interviewerReply.data });
+  return ok({ interviewerReply: interviewerReply.data });
 });
 
 export const posFinalEvaluationSchema = schema((value) => {
   if (!isObject(value)) return fail([], 'Expected an object');
+  const knownKeys = assertKnownKeys(value, ['summary', 'skillEvaluations'], []);
+  if (!knownKeys.success) return knownKeys;
 
   const summary = asRequiredString(value.summary, ['summary']);
   if (!summary.success) return summary;
@@ -149,8 +214,10 @@ export const posFinalEvaluationSchema = schema((value) => {
   for (let index = 0; index < value.skillEvaluations.length; index++) {
     const item = value.skillEvaluations[index];
     if (!isObject(item)) return fail(['skillEvaluations', index], 'Expected an object');
+    const itemKeys = assertKnownKeys(item, ['skillKey', 'score', 'feedback'], ['skillEvaluations', index]);
+    if (!itemKeys.success) return itemKeys;
 
-    const skillKey = asRequiredString(item.skillKey, ['skillEvaluations', index, 'skillKey']);
+    const skillKey = asCanonicalSkillKey(item.skillKey, ['skillEvaluations', index, 'skillKey']);
     if (!skillKey.success) return skillKey;
 
     const score = asScore(item.score, ['skillEvaluations', index, 'score']);
@@ -160,7 +227,6 @@ export const posFinalEvaluationSchema = schema((value) => {
     if (!feedback.success) return feedback;
 
     skillEvaluations.push({
-      ...item,
       skillKey: skillKey.data,
       score: score.data,
       feedback: feedback.data

@@ -9,6 +9,7 @@
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "test:dashboard": "node --test dashboard.test.mjs",
+    "test:contracts": "node --test packages/schemas/src/ai-contracts.test.mjs",
     "db:migrate": "node packages/database/scripts/apply-sql.mjs migrate",
     "db:seed": "node packages/database/scripts/apply-sql.mjs seed",
     "db:setup": "node packages/database/scripts/apply-sql.mjs all",
