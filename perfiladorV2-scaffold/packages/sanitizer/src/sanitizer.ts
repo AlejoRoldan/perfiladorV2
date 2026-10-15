@@ -52,9 +52,19 @@ export class SecretSanitizer {
     },
     // 9. Asignaciones de contraseñas y secretos
     {
+      name: 'SUPABASE_SECRET_KEY',
+      pattern: /sb_secret_[A-Za-z0-9_-]{20,}/g,
+      replacement: '[REDACTED_SUPABASE_SECRET_KEY]'
+    },
+    {
+      name: 'JSON_ASSIGNED_SECRET',
+      pattern: /(["'])(api[_-]?key|secret|password|passwd|auth[_-]?token|access[_-]?token|private[_-]?key)(["']\s*:\s*["'])([^"']{8,})(["'])/gi,
+      replacement: '$1$2$3[REDACTED_SECRET]$5'
+    },
+    {
       name: 'GENERIC_ASSIGNED_SECRET',
-      pattern: /(api[_-]?key|secret|password|passwd|auth[_-]?token|access[_-]?token|private[_-]?key)(\s*[:=]\s*["'])([^"']{8,})(["'])/gi,
-      replacement: '$1$2[REDACTED_SECRET]$4'
+      pattern: /(^|[\s;])([A-Z0-9_]*(?:API[_-]?KEY|SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE[_-]?KEY)[A-Z0-9_]*)(\s*=\s*)(["']?)([^\s"'`;]{8,})(["']?)/gim,
+      replacement: '$1$2$3$4[REDACTED_SECRET]$6'
     }
   ];
 
@@ -75,7 +85,7 @@ export class SecretSanitizer {
         }
         if (rule.replacement.includes('$')) {
           let str = rule.replacement;
-          for (let i = 1; i <= 4; i++) {
+          for (let i = 1; i <= 6; i++) {
             str = str.replace(`$${i}`, args[i] || '');
           }
           return str;
