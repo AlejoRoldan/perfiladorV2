@@ -21,6 +21,32 @@ const MAX_REQUEST_BODY_BYTES = Number(process.env.MAX_REQUEST_BODY_BYTES || 256_
 const ALLOWED_TRACKS = new Set(['BACKEND_NODE', 'FRONTEND_REACT', 'FULLSTACK']);
 const ALLOWED_SENIORITIES = new Set(['JUNIOR_1', 'JUNIOR_2', 'MID_1', 'MID_2', 'SENIOR_1']);
 
+// Contraseña de acceso (basic auth). En producción es obligatoria.
+const BASIC_AUTH_USER = process.env.BASIC_AUTH_USER || '';
+const BASIC_AUTH_PASSWORD = process.env.BASIC_AUTH_PASSWORD || '';
+if (process.env.NODE_ENV === 'production' && (!BASIC_AUTH_USER || !BASIC_AUTH_PASSWORD)) {
+  console.error('Faltan BASIC_AUTH_USER y BASIC_AUTH_PASSWORD (obligatorias en producción).');
+  process.exit(1);
+}
+
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function isAuthorized(req) {
+  if (!BASIC_AUTH_USER) return true; // en local, sin usuario, no se pide contraseña
+  const [scheme, encoded] = String(req.headers.authorization || '').split(' ');
+  if (scheme !== 'Basic' || !encoded) return false;
+  const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+  const separator = decoded.indexOf(':');
+  if (separator < 0) return false;
+  const userOk = safeEqual(decoded.slice(0, separator), BASIC_AUTH_USER);
+  const passwordOk = safeEqual(decoded.slice(separator + 1), BASIC_AUTH_PASSWORD);
+  return userOk && passwordOk;
+}
+
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
@@ -1306,6 +1332,15 @@ const server = http.createServer(async (req, res) => {
     });
     res.end(content);
   };
+
+  if (!isAuthorized(req)) {
+    res.writeHead(401, {
+      'WWW-Authenticate': 'Basic realm="TechProfiler", charset="UTF-8"',
+      'Content-Type': 'text/plain; charset=utf-8'
+    });
+    res.end('Acceso restringido');
+    return;
+  }
 
   if (req.method === 'POST') {
     try {
