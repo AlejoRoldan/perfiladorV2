@@ -1,7 +1,8 @@
 import { GoogleGenAI } from '@google/genai';
 import {
   SkillSynthesisReportSchema,
-  SkillSynthesisReport
+  SkillSynthesisReport,
+  CanonicalSkillKey
 } from '@perfilador/schemas';
 import {
   db,
@@ -78,7 +79,7 @@ export class SkillSynthesizerAgent {
     // 4. Calcular ponderación matemática con decaimiento temporal
     const now = new Date().getTime();
     const calculatedSkills: Array<{
-      skillKey: string;
+      skillKey: CanonicalSkillKey;
       synthesizedScore: number;
       confidenceScore: number;
       signalCount: number;
@@ -89,10 +90,11 @@ export class SkillSynthesizerAgent {
 
     // Obtener taxonomía y benchmarks para comparar
     const taxonomy = await db.select().from(skillTaxonomy);
-    const validKeys = new Set(taxonomy.map((t) => t.skillKey));
+    const validKeys = new Set(taxonomy.map((t: { skillKey: string }) => t.skillKey));
 
     for (const [key, items] of skillDataMap.entries()) {
       if (!validKeys.has(key)) continue;
+      const skillKey = key as CanonicalSkillKey;
 
       let sumWeightedScores = 0;
       let sumWeights = 0;
@@ -116,7 +118,7 @@ export class SkillSynthesizerAgent {
           and(
             eq(seniorityBenchmarks.track, dev.techTrack),
             eq(seniorityBenchmarks.seniorityLevel, dev.targetSeniority),
-            eq(seniorityBenchmarks.skillKey, key)
+            eq(seniorityBenchmarks.skillKey, skillKey)
           )
         )
         .limit(1);
@@ -129,7 +131,7 @@ export class SkillSynthesizerAgent {
       else if (gapVsTarget >= 0) status = 'ON_TRACK';
 
       calculatedSkills.push({
-        skillKey: key,
+        skillKey,
         synthesizedScore,
         confidenceScore,
         signalCount: items.length,
@@ -142,7 +144,7 @@ export class SkillSynthesizerAgent {
     // 5. Invocación a Gemini para síntesis cualitativa y diagnóstico ejecutivo
     const prompt = `
 Eres un Staff Principal Architect y CTO Advisor analizando la síntesis de competencias de un ingeniero.
-Desarrollador: ${dev.email}
+Colaborador interno: ${dev.id}
 Nivel Actual: ${dev.currentSeniority} ➔ Meta de Ascenso: ${dev.targetSeniority}
 Track: ${dev.techTrack}
 

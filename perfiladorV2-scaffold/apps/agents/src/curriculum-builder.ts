@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import { SecretSanitizer } from '@perfilador/sanitizer';
 import {
   CurriculumModuleSpecSchema,
   CurriculumModuleSpec
@@ -54,10 +55,16 @@ export class CurriculumBuilderAgent {
 
     // 2. Obtener definición de la habilidad desde skill_taxonomy
     const skillRows = await db.select().from(skillTaxonomy).where(eq(skillTaxonomy.skillKey, input.skillKey)).limit(1);
-    const skillName = skillRows[0]?.displayName || input.skillKey;
-    const skillDesc = skillRows[0]?.description || '';
+    if (skillRows.length === 0) {
+      throw new Error(`Skill no encontrada en taxonomia: ${input.skillKey}`);
+    }
+    const skillName = skillRows[0].displayName;
+    const skillDesc = skillRows[0].description || '';
+    const sanitizedAntipatterns = (input.antipatternsFound || [])
+      .map((item) => SecretSanitizer.sanitize(item).sanitized)
+      .filter((item) => item.trim().length > 0);
 
-    console.log(`🎓 [CurriculumBuilder] Generando cápsula L&D para ${dev.email} sobre [${input.skillKey}]...`);
+    console.log(`🎓 [CurriculumBuilder] Generando capsula L&D para colaborador ${dev.id} sobre [${input.skillKey}]...`);
 
     // 3. Construcción del Prompt Socrático de L&D
     const prompt = `
@@ -65,7 +72,7 @@ Eres el Chief Learning Officer y Staff Architect de ${orgName}.
 Tu objetivo es diseñar una micro-cápsula de aprendizaje Just-In-Time (JIT) interactiva para cerrar una brecha técnica crítica.
 
 Perfil del Colaborador:
-- Correo: ${dev.email}
+- ID interno: ${dev.id}
 - Rol actual: ${dev.currentSeniority} ➔ Meta de Ascenso: ${dev.targetSeniority}
 - Track Técnico: ${dev.techTrack}
 
@@ -73,7 +80,7 @@ Habilidad en Brecha:
 - Clave: "${input.skillKey}" (${skillName})
 - Descripción de referencia: ${skillDesc}
 ${input.gapVsTarget ? `- Brecha cuantitativa contra el benchmark: ${input.gapVsTarget} puntos` : ''}
-${input.antipatternsFound && input.antipatternsFound.length > 0 ? `- Antipatrones detectados recientemente en su código:\n  ${input.antipatternsFound.map(a => `* ${a}`).join('\n  ')}` : ''}
+${sanitizedAntipatterns.length > 0 ? `- Antipatrones detectados recientemente en su código:\n  ${sanitizedAntipatterns.map(a => `* ${a}`).join('\n  ')}` : ''}
 
 Requisitos de la Cápsula L&D:
 1. "title": Título atractivo, técnico y formativo para ingeniería de producción.

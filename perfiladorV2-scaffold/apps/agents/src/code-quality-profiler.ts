@@ -66,9 +66,10 @@ ${sanitized}
 
 Evalúa las dimensiones de ingeniería de software:
 - CLEAN_ARCHITECTURE (Separación de responsabilidades, acoplamiento, cohesión)
-- CONCURRENCY_ASYNC (Manejo correcto de asincronía, race conditions, ACID)
-- TESTING_RESILIENCE (Manejo de errores, validaciones defensivas)
-- CODE_SIMPLICITY (Legibilidad, mantenibilidad, SOLID)
+- SQL_OPTIMIZATION_CONCURRENCY (Manejo correcto de asincronia, race conditions, ACID y concurrencia en datos)
+- TESTING_STRATEGY (Cobertura, manejo de errores, validaciones defensivas y estrategia de pruebas)
+- OWASP_INPUT_VALIDATION (Validacion de entradas y controles de seguridad)
+- API_CONTRACTS (Contratos, compatibilidad y diseno de interfaces)
 
 Debes responder ÚNICAMENTE en formato JSON válido que cumpla estrictamente con este esquema:
 {

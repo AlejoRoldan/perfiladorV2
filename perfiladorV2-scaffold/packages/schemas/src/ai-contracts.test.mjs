@@ -54,6 +54,19 @@ test('Proof of Skills final evaluation rejects unknown skill keys', () => {
   );
 });
 
+test('Proof of Skills final evaluation rejects duplicate skill keys', () => {
+  assert.throws(
+    () => parseJsonWithSchema(JSON.stringify({
+      summary: 'Solid answer',
+      skillEvaluations: [
+        { skillKey: 'TESTING_STRATEGY', score: 4.2, feedback: 'Detailed trade-offs' },
+        { skillKey: 'testing_strategy', score: 3.8, feedback: 'Repeated signal' }
+      ]
+    }), posFinalEvaluationSchema, 'PoS final evaluation'),
+    /Duplicate skill key/
+  );
+});
+
 test('AI schemas reject unexpected fields and return sanitized contract shape', () => {
   assert.throws(
     () => parseJsonWithSchema(JSON.stringify({

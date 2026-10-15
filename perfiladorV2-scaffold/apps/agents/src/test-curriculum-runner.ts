@@ -12,10 +12,10 @@ async function run() {
   console.log('🤖 [1/3] Inicializando CurriculumBuilderAgent...\n');
   const builder = new CurriculumBuilderAgent();
 
-  console.log('📚 [2/3] Diseñando micro-cápsula L&D interactiva para CONCURRENCY_ASYNC...');
+  console.log('📚 [2/3] Diseñando micro-cápsula L&D interactiva para SQL_OPTIMIZATION_CONCURRENCY...');
   const moduleSpec = await builder.buildModule({
     email: testEmail,
-    skillKey: 'CONCURRENCY_ASYNC',
+    skillKey: 'SQL_OPTIMIZATION_CONCURRENCY',
     gapVsTarget: -1.2,
     antipatternsFound: [
       'Race Condition / Lost Update en operaciones de saldo',
