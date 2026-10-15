@@ -9,6 +9,7 @@
     "db:migrate": "node scripts/apply-sql.mjs migrate",
     "db:seed": "node scripts/apply-sql.mjs seed",
     "db:setup": "node scripts/apply-sql.mjs all",
+    "test": "node --test scripts/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
