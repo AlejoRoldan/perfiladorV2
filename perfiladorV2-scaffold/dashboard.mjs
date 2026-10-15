@@ -2,419 +2,820 @@ import http from 'http';
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { URL } from 'url';
+import {
+  parseJsonWithSchema,
+  posChatResponseSchema,
+  posFinalEvaluationSchema,
+  posStartResponseSchema
+} from './packages/schemas/src/ai-contracts.mjs';
 
 dotenv.config();
 
-const { Client } = pg;
+const PORT = Number(process.env.DASHBOARD_PORT || 3005);
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
+const SCHEMA_VERSION = '2026-09-29.pos.v1';
+const RUBRIC_VERSION = '2026-09-29.base-taxonomy.v1';
+const ALLOWED_TRACKS = new Set(['BACKEND_NODE', 'FRONTEND_REACT', 'FULLSTACK']);
+const ALLOWED_SENIORITIES = new Set(['JUNIOR_1', 'JUNIOR_2', 'MID_1', 'MID_2', 'SENIOR_1']);
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
+});
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const PORT = 3005;
 
-async function getDashboardData() {
-  const db = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-  });
-  await db.connect();
+const query = (text, params) => pool.query(text, params);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const normalizeText = value => String(value ?? '').trim();
+const normalizeEmail = value => normalizeText(value).toLowerCase();
+const escapeHtml = value => String(value ?? '')
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&#39;');
 
-  const devRes = await db.query(`
-    SELECT d.id, d.email, d.current_seniority, d.target_seniority, d.tech_track, o.name as org_name
+async function askGemini(prompt, schema, label) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: prompt,
+        config: { responseMimeType: 'application/json' }
+      });
+      return parseJsonWithSchema(res.text, schema, label);
+    } catch (err) {
+      console.error(`[Gemini ${label} attempt ${attempt}]`, err.message);
+      if (attempt === 3) throw err;
+      await sleep(1500 * attempt);
+    }
+  }
+}
+
+async function getDeveloper(devId = null) {
+  if (devId && String(devId).trim()) {
+    const byId = await query(`
+      SELECT d.id, d.email, d.current_seniority, d.target_seniority, d.tech_track,
+             o.name AS org_name, o.slug AS org_slug
+      FROM developers d
+      JOIN organizations o ON d.org_id = o.id
+      WHERE d.id = $1
+    `, [String(devId).trim()]);
+    if (byId.rows[0]) return byId.rows[0];
+  }
+
+  const latest = await query(`
+    SELECT d.id, d.email, d.current_seniority, d.target_seniority, d.tech_track,
+           o.name AS org_name, o.slug AS org_slug
     FROM developers d
     JOIN organizations o ON d.org_id = o.id
-    WHERE d.email = 'carlos.mendoza@uenobank.com.py'
+    ORDER BY d.created_at DESC
+    LIMIT 1
   `);
-  const dev = devRes.rows[0];
-
-  const skillsRes = await db.query(`
-    SELECT 
-      st.skill_key, 
-      st.display_name, 
-      COALESCE(dsm.current_score, 1.0) as current_score,
-      COALESCE(sb.required_score, 3.5) as required_score,
-      COALESCE(dsm.gap_vs_target, -2.5) as gap_vs_target
-    FROM skill_taxonomy st
-    LEFT JOIN developer_skill_matrix dsm ON st.skill_key = dsm.skill_key AND dsm.developer_id = $1
-    LEFT JOIN seniority_benchmarks sb ON st.skill_key = sb.skill_key AND sb.seniority_level = $2 AND sb.track = $3
-    ORDER BY st.domain ASC
-  `, [dev.id, dev.target_seniority, dev.tech_track]);
-
-  const modulesRes = await db.query(`
-    SELECT id, title, skill_key, content_blocks, interactive_challenge, status, completed_at
-    FROM learning_modules
-    WHERE developer_id = $1
-    ORDER BY created_at DESC
-  `, [dev.id]);
-
-  await db.end();
-  return { dev, skills: skillsRes.rows, modules: modulesRes.rows };
+  return latest.rows[0] || null;
 }
 
-async function evaluateCodeSnippet(code) {
-  const db = new Client({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+async function getDashboardData(devId = null) {
+  const dev = await getDeveloper(devId);
+
+  const [allDevsRes, cohortStatsRes] = await Promise.all([
+    query(`
+      SELECT d.id, d.email, d.current_seniority, d.target_seniority, d.tech_track,
+             o.name AS org_name, o.slug AS org_slug
+      FROM developers d
+      JOIN organizations o ON d.org_id = o.id
+      ORDER BY o.name ASC, d.email ASC
+    `),
+    query(`
+      SELECT
+        o.slug AS org_slug,
+        o.name AS org_name,
+        COUNT(DISTINCT d.id)::int AS total_developers,
+        COUNT(DISTINCT es.id)::int AS completed_sessions,
+        COUNT(DISTINCT lm.id) FILTER (WHERE lm.status = 'ASSIGNED')::int AS assigned_modules,
+        COUNT(DISTINCT lm.id) FILTER (WHERE lm.status = 'COMPLETED')::int AS completed_modules
+      FROM organizations o
+      LEFT JOIN developers d ON d.org_id = o.id
+      LEFT JOIN evaluation_signals es ON es.developer_id = d.id AND es.source_type = 'CONVERSATIONAL_PROOF_OF_SKILL'
+      LEFT JOIN learning_modules lm ON lm.developer_id = d.id
+      GROUP BY o.slug, o.name
+      ORDER BY o.name ASC
+    `)
+  ]);
+
+  if (!dev) {
+    return { dev: null, skills: [], modules: [], allDevs: allDevsRes.rows, cohortStats: cohortStatsRes.rows };
+  }
+
+  const [skillsRes, modulesRes] = await Promise.all([
+    query(`
+      SELECT st.skill_key, st.display_name,
+             COALESCE(dsm.current_score, 1.0) AS current_score,
+             COALESCE(sb.required_score, 3.5) AS required_score,
+             COALESCE(dsm.gap_vs_target, -2.5) AS gap_vs_target
+      FROM skill_taxonomy st
+      LEFT JOIN developer_skill_matrix dsm ON st.skill_key = dsm.skill_key AND dsm.developer_id = $1
+      LEFT JOIN seniority_benchmarks sb ON st.skill_key = sb.skill_key AND sb.seniority_level = $2 AND sb.track = $3
+      ORDER BY st.domain ASC, st.display_name ASC
+    `, [dev.id, dev.target_seniority, dev.tech_track]),
+    query(`
+      SELECT id, title, skill_key, content_blocks, interactive_challenge, status, completed_at
+      FROM learning_modules
+      WHERE developer_id = $1
+      ORDER BY created_at DESC
+    `, [dev.id])
+  ]);
+
+  return { dev, skills: skillsRes.rows, modules: modulesRes.rows, allDevs: allDevsRes.rows, cohortStats: cohortStatsRes.rows };
+}
+
+function validateDeveloperInput({ email, orgSlug, currentSeniority, targetSeniority, techTrack }) {
+  const input = {
+    email: normalizeEmail(email),
+    orgSlug: normalizeText(orgSlug || 'itti'),
+    currentSeniority: normalizeText(currentSeniority || 'JUNIOR_2').toUpperCase(),
+    targetSeniority: normalizeText(targetSeniority || 'MID_2').toUpperCase(),
+    techTrack: normalizeText(techTrack || 'BACKEND_NODE').toUpperCase()
+  };
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input.email)) throw new Error('Correo invalido');
+  if (!ALLOWED_SENIORITIES.has(input.currentSeniority)) throw new Error(`Nivel actual invalido: ${input.currentSeniority}`);
+  if (!ALLOWED_SENIORITIES.has(input.targetSeniority)) throw new Error(`Meta invalida: ${input.targetSeniority}`);
+  if (!ALLOWED_TRACKS.has(input.techTrack)) throw new Error(`Track invalido: ${input.techTrack}`);
+  return input;
+}
+
+function parseCsvLine(line) {
+  const cells = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      current += '"';
+      i++;
+    } else if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      cells.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseCollaboratorCsv(csvText, defaultOrgSlug = 'itti') {
+  const lines = String(csvText ?? '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return [];
+
+  const first = parseCsvLine(lines[0]).map(cell => cell.toLowerCase());
+  const hasHeader = first.includes('email');
+  const headers = hasHeader ? first : ['email', 'current_seniority', 'target_seniority', 'tech_track'];
+  const dataLines = hasHeader ? lines.slice(1) : lines;
+
+  return dataLines.map((line, index) => {
+    const cells = parseCsvLine(line);
+    const row = Object.fromEntries(headers.map((header, i) => [header, cells[i] ?? '']));
+    return {
+      rowNumber: index + (hasHeader ? 2 : 1),
+      email: row.email,
+      orgSlug: row.org_slug || row.organization || defaultOrgSlug,
+      currentSeniority: row.current_seniority || row.currentSeniority,
+      targetSeniority: row.target_seniority || row.targetSeniority,
+      techTrack: row.tech_track || row.techTrack
+    };
   });
-  await db.connect();
+}
 
-  const devRes = await db.query("SELECT id, tech_track, target_seniority FROM developers WHERE email = 'carlos.mendoza@uenobank.com.py'");
+async function registerDeveloper(input) {
+  const devInput = validateDeveloperInput(input);
+  const orgRes = await query('SELECT id FROM organizations WHERE slug = $1 LIMIT 1', [devInput.orgSlug]);
+  if (!orgRes.rows.length) throw new Error(`Organizacion no encontrada: ${devInput.orgSlug}`);
+
+  const devRes = await query(`
+    INSERT INTO developers (org_id, email, github_username, current_seniority, target_seniority, tech_track)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (email) DO UPDATE
+    SET org_id = EXCLUDED.org_id,
+        current_seniority = EXCLUDED.current_seniority,
+        target_seniority = EXCLUDED.target_seniority,
+        tech_track = EXCLUDED.tech_track,
+        updated_at = now()
+    RETURNING id, email, current_seniority, target_seniority, tech_track
+  `, [
+    orgRes.rows[0].id,
+    devInput.email,
+    devInput.email.split('@')[0],
+    devInput.currentSeniority,
+    devInput.targetSeniority,
+    devInput.techTrack
+  ]);
+
   const dev = devRes.rows[0];
+  const skillsRes = await query('SELECT skill_key FROM skill_taxonomy');
 
-  const rubricsRes = await db.query("SELECT skill_key, display_name, rubric_levels FROM skill_taxonomy");
+  for (const s of skillsRes.rows) {
+    const bench = await query(`
+      SELECT required_score
+      FROM seniority_benchmarks
+      WHERE track = $1 AND seniority_level = $2 AND skill_key = $3
+    `, [dev.tech_track, dev.target_seniority, s.skill_key]);
+    const required = Number(bench.rows[0]?.required_score || 3.5);
+
+    await query(`
+      INSERT INTO developer_skill_matrix (developer_id, skill_key, current_score, confidence_score, last_signal_at, gap_vs_target)
+      VALUES ($1, $2, 1.0, 0.5, now(), $3)
+      ON CONFLICT (developer_id, skill_key) DO UPDATE
+      SET gap_vs_target = developer_skill_matrix.current_score - $4,
+          updated_at = now()
+    `, [dev.id, s.skill_key, 1.0 - required, required]);
+  }
+
+  return dev;
+}
+
+async function importCollaborators({ csvText, orgSlug = 'itti' }) {
+  const rows = parseCollaboratorCsv(csvText, orgSlug);
+  if (!rows.length) throw new Error('El CSV no contiene filas para importar');
+  if (rows.length > 100) throw new Error('Maximo 100 colaboradores por importacion');
+
+  const imported = [];
+  const errors = [];
+  const seen = new Set();
+
+  for (const row of rows) {
+    try {
+      const email = normalizeEmail(row.email);
+      if (seen.has(email)) {
+        errors.push({ row: row.rowNumber, email, error: 'Correo duplicado en el CSV' });
+        continue;
+      }
+      seen.add(email);
+      const dev = await registerDeveloper(row);
+      imported.push({ row: row.rowNumber, id: dev.id, email: dev.email });
+    } catch (err) {
+      errors.push({ row: row.rowNumber, email: row.email || '', error: err.message });
+    }
+  }
+
+  return { success: errors.length === 0, importedCount: imported.length, errorCount: errors.length, imported, errors };
+}
+
+async function startPoS(devId) {
+  const dev = await getDeveloper(devId);
+  if (!dev) throw new Error('No hay colaborador seleccionado');
 
   const prompt = `
-Eres un Staff Principal Engineer y Evaluador de L&D.
-Evalúa el siguiente fragmento de código de un Pull Request:
-\`\`\`javascript
-${code}
-\`\`\`
-Rúbricas oficiales de la empresa:
-${JSON.stringify(rubricsRes.rows, null, 2)}
+Eres el Staff Principal Architect de ${dev.org_name}.
+Inicia una sesion de Proof of Skills con ${dev.email.split('@')[0]}.
+Perfil: nivel actual ${dev.current_seniority}, meta ${dev.target_seniority}, track ${dev.tech_track}.
+Plantea una primera pregunta desafiante sobre un caso real de ingenieria: concurrencia, ACID, microservicios, resiliencia u observabilidad.
+Responde solo JSON:
+{ "welcomeMessage": "Saludo profesional y caso practico inicial" }`;
 
-Evalúa de 1.0 a 5.0 las habilidades que sean aplicables al código enviado (ej. CLEAN_ARCHITECTURE, OWASP_INPUT_VALIDATION, SQL_OPTIMIZATION_CONCURRENCY, etc.).
-Responde ÚNICAMENTE en JSON con esta estructura:
-{
-  "evaluations": [
-    {
-      "skillKey": "nombre_habilidad",
-      "score": 4.5,
-      "rationale": "explicación de la nota",
-      "antipatterns": []
-    }
-  ]
+  return askGemini(prompt, posStartResponseSchema, 'PoS start');
 }
-`;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: prompt,
-    config: { responseMimeType: 'application/json' }
-  });
+async function chatPoS(devId, history, userResponse) {
+  const dev = await getDeveloper(devId);
+  if (!dev) throw new Error('No hay colaborador seleccionado');
 
-  const parsed = JSON.parse(response.text.trim());
+  const prompt = `
+Eres el Staff Principal Architect de ${dev.org_name} evaluando a ${dev.email.split('@')[0]}.
+Track: ${dev.tech_track}. Meta: ${dev.target_seniority}.
 
-  // Actualizar la base de datos para cada habilidad evaluada
-  for (const item of parsed.evaluations) {
-    const benchmarkRes = await db.query(
-      "SELECT required_score FROM seniority_benchmarks WHERE track = $1 AND seniority_level = $2 AND skill_key = $3",
-      [dev.tech_track, dev.target_seniority, item.skillKey]
-    );
-    const required = benchmarkRes.rows[0]?.required_score || 3.50;
-    const gap = Number(item.score) - Number(required);
+Historial:
+${JSON.stringify(history, null, 2)}
 
-    await db.query(`
+Ultima respuesta:
+"${userResponse}"
+
+Evalua fortalezas y vacios tecnicos. Plantea una pregunta de seguimiento sobre trade-offs, escalabilidad, seguridad u operacion.
+Responde solo JSON:
+{ "interviewerReply": "Comentario tecnico y pregunta de seguimiento" }`;
+
+  return askGemini(prompt, posChatResponseSchema, 'PoS chat');
+}
+
+async function finishPoS(devId, history) {
+  const dev = await getDeveloper(devId);
+  if (!dev) throw new Error('No hay colaborador seleccionado');
+
+  const rubrics = await query('SELECT skill_key, display_name, rubric_levels FROM skill_taxonomy');
+  const prompt = `
+Evalua esta transcripcion tecnica de Proof of Skills para ${dev.email}.
+Meta: ${dev.target_seniority}. Track: ${dev.tech_track}.
+
+Transcripcion:
+${JSON.stringify(history, null, 2)}
+
+Rubricas:
+${JSON.stringify(rubrics.rows, null, 2)}
+
+Califica de 1.0 a 5.0 solamente las habilidades demostradas.
+Responde solo JSON:
+{
+  "summary": "Resumen ejecutivo del desempeno",
+  "skillEvaluations": [
+    { "skillKey": "CLEAN_ARCHITECTURE", "score": 4.5, "feedback": "Justificacion" }
+  ]
+}`;
+
+  const verdict = await askGemini(prompt, posFinalEvaluationSchema, 'PoS final evaluation');
+  const audit = {
+    turns: history.length,
+    model: GEMINI_MODEL,
+    promptFamily: 'proof-of-skills-interview',
+    schemaVersion: SCHEMA_VERSION,
+    rubricVersion: RUBRIC_VERSION
+  };
+
+  await query(`
+    INSERT INTO evaluation_signals (developer_id, source_type, external_ref, diff_summary, raw_evaluations)
+    VALUES ($1, 'CONVERSATIONAL_PROOF_OF_SKILL', 'ENTREVISTA-POS', $2, $3)
+  `, [dev.id, JSON.stringify(audit), JSON.stringify({ ...verdict, audit })]);
+
+  for (const item of verdict.skillEvaluations) {
+    const bench = await query(`
+      SELECT required_score
+      FROM seniority_benchmarks
+      WHERE track = $1 AND seniority_level = $2 AND skill_key = $3
+    `, [dev.tech_track, dev.target_seniority, item.skillKey]);
+    const required = Number(bench.rows[0]?.required_score || 3.5);
+    const gap = Number(item.score) - required;
+
+    await query(`
       INSERT INTO developer_skill_matrix (developer_id, skill_key, current_score, confidence_score, last_signal_at, gap_vs_target)
-      VALUES ($1, $2, $3, 0.95, NOW(), $4)
-      ON CONFLICT (developer_id, skill_key) DO UPDATE 
+      VALUES ($1, $2, $3, 0.98, now(), $4)
+      ON CONFLICT (developer_id, skill_key) DO UPDATE
       SET current_score = EXCLUDED.current_score,
-          last_signal_at = NOW(),
-          gap_vs_target = EXCLUDED.gap_vs_target;
+          confidence_score = EXCLUDED.confidence_score,
+          last_signal_at = now(),
+          gap_vs_target = EXCLUDED.gap_vs_target,
+          updated_at = now()
     `, [dev.id, item.skillKey, item.score, gap]);
   }
 
-  await db.end();
-  return parsed;
+  return verdict;
 }
 
-function renderSvgRadar(skills) {
-  const size = 380;
-  const center = size / 2; // 190
-  const maxR = 105;
+function renderRadarSvg(skills) {
+  const size = 360;
+  const center = 180;
+  const maxR = 100;
   const n = skills.length || 5;
-
-  const getPoint = (score, i, customR = null) => {
+  const pt = (score, i, r = null) => {
     const angle = (Math.PI * 2 / n) * i - Math.PI / 2;
-    const r = customR !== null ? customR : (Math.min(5, Math.max(0, score)) / 5) * maxR;
-    return {
-      x: center + r * Math.cos(angle),
-      y: center + r * Math.sin(angle)
-    };
+    const radius = r !== null ? r : (Math.min(5, Math.max(0, score)) / 5) * maxR;
+    return { x: center + radius * Math.cos(angle), y: center + radius * Math.sin(angle) };
   };
 
-  // Anillos concéntricos
-  let rings = '';
-  for (let lvl = 1; lvl <= 5; lvl++) {
-    const pts = [];
-    for (let i = 0; i < n; i++) {
-      const p = getPoint(lvl, i);
-      pts.push(`${p.x.toFixed(1)},${p.y.toFixed(1)}`);
-    }
-    rings += `<polygon points="${pts.join(' ')}" fill="none" stroke="rgba(51, 65, 85, 0.45)" stroke-width="1"/>`;
-    rings += `<text x="${center + 4}" y="${center - (lvl / 5 * maxR) + 3}" fill="#64748b" font-size="9" font-family="monospace">${lvl}</text>`;
-  }
-
-  // Ejes radiales y etiquetas de texto en cada vértice
-  let axes = '';
-  let labelsSvg = '';
-  for (let i = 0; i < n; i++) {
-    const p = getPoint(5, i);
-    axes += `<line x1="${center}" y1="${center}" x2="${p.x.toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="rgba(51, 65, 85, 0.6)" stroke-width="1"/>`;
-    
-    // Etiqueta en el vértice
-    const lp = getPoint(5, i, maxR + 24);
-    const angle = (Math.PI * 2 / n) * i - Math.PI / 2;
-    const anchor = Math.abs(Math.cos(angle)) < 0.25 ? 'middle' : (Math.cos(angle) > 0 ? 'start' : 'end');
-    const skillWords = skills[i].display_name.split(' ');
-    const shortName = skillWords.slice(0, 2).join(' ');
-    labelsSvg += `<text x="${lp.x.toFixed(1)}" y="${lp.y.toFixed(1)}" fill="#94a3b8" font-size="9" font-weight="600" text-anchor="${anchor}">${shortName}</text>`;
-  }
-
-  // Polígono Meta
-  const targetPts = skills.map((s, i) => {
-    const p = getPoint(Number(s.required_score), i);
-    return `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
-  }).join(' ');
-
-  // Polígono Actual
-  const currentPts = skills.map((s, i) => {
-    const p = getPoint(Number(s.current_score), i);
-    return `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
-  }).join(' ');
-
-  // Puntos
+  let grid = '';
+  let labels = '';
   let dots = '';
+  for (let l = 1; l <= 5; l++) {
+    const pts = skills.map((_, i) => `${pt(l, i).x.toFixed(1)},${pt(l, i).y.toFixed(1)}`).join(' ');
+    grid += `<polygon points="${pts}" fill="none" stroke="rgba(51,65,85,0.4)" stroke-width="1"/>`;
+    grid += `<text x="${center + 4}" y="${center - (l / 5 * maxR) + 3}" fill="#64748b" font-size="8">${l}</text>`;
+  }
+
   skills.forEach((s, i) => {
-    const p = getPoint(Number(s.current_score), i);
-    dots += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" fill="#10b981" stroke="#047857" stroke-width="1.5"/>`;
+    const p = pt(5, i);
+    grid += `<line x1="${center}" y1="${center}" x2="${p.x.toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="rgba(51,65,85,0.5)" stroke-width="1"/>`;
+    const lp = pt(5, i, maxR + 22);
+    const anchor = Math.abs(lp.x - center) < 15 ? 'middle' : (lp.x > center ? 'start' : 'end');
+    const label = escapeHtml(s.display_name).split(' ').slice(0, 2).join(' ');
+    labels += `<text x="${lp.x.toFixed(1)}" y="${lp.y.toFixed(1)}" fill="#94a3b8" font-size="9" font-weight="600" text-anchor="${anchor}">${label}</text>`;
+    const cp = pt(Number(s.current_score), i);
+    dots += `<circle cx="${cp.x.toFixed(1)}" cy="${cp.y.toFixed(1)}" r="4" fill="#10b981" stroke="#047857" stroke-width="1.5"/>`;
   });
 
+  const targetPts = skills.map((s, i) => `${pt(Number(s.required_score), i).x.toFixed(1)},${pt(Number(s.required_score), i).y.toFixed(1)}`).join(' ');
+  const currentPts = skills.map((s, i) => `${pt(Number(s.current_score), i).x.toFixed(1)},${pt(Number(s.current_score), i).y.toFixed(1)}`).join(' ');
+
   return `
-    <svg viewBox="0 0 ${size} ${size}" class="w-full max-w-[360px] aspect-square overflow-visible">
-      ${rings}
-      ${axes}
-      ${labelsSvg}
-      <polygon points="${targetPts}" fill="rgba(245, 158, 11, 0.08)" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4,4"/>
-      <polygon points="${currentPts}" fill="rgba(16, 185, 129, 0.35)" stroke="#10b981" stroke-width="2.5"/>
+    <svg viewBox="0 0 ${size} ${size}" class="w-full max-w-[340px] aspect-square overflow-visible">
+      ${grid} ${labels}
+      <polygon points="${targetPts}" fill="rgba(245,158,11,0.08)" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4,4"/>
+      <polygon points="${currentPts}" fill="rgba(16,185,129,0.35)" stroke="#10b981" stroke-width="2.5"/>
       ${dots}
-    </svg>
-  `;
+    </svg>`;
 }
 
-function renderHTML(data) {
-  const { dev, skills, modules } = data;
-  const radarSvg = renderSvgRadar(skills);
+function renderHTML({ dev, skills, modules, allDevs, cohortStats }) {
+  const radarSvg = renderRadarSvg(skills);
+  const orgName = escapeHtml(dev?.org_name || 'Portal');
+  const selectedDevId = dev?.id || '';
+  const ittiStats = cohortStats.find(stat => stat.org_slug === 'itti') || {};
+  const currentModulesCount = modules.length;
 
   return `<!DOCTYPE html>
 <html lang="es" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TechProfiler - ${dev.org_name}</title>
+  <title>TechProfiler - ${orgName}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <style> body { font-family: 'Inter', sans-serif; } </style>
+  <style>body { font-family: 'Inter', sans-serif; }</style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
-  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
-    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+  <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-6 py-3.5 flex items-center justify-between">
       <div class="flex items-center gap-3">
-        <div class="h-10 w-10 bg-emerald-500 rounded-xl flex items-center justify-center font-bold text-slate-950 text-xl shadow-lg shadow-emerald-500/20">
-          TP
-        </div>
+        <div class="h-10 w-10 bg-emerald-500 rounded-lg flex items-center justify-center font-bold text-slate-950 text-xl shadow-lg shadow-emerald-500/20">TP</div>
         <div>
           <div class="flex items-center gap-2">
-            <h1 class="text-lg font-bold text-white tracking-tight">TechProfiler & L&D</h1>
-            <span class="text-[11px] bg-slate-800 text-slate-300 px-2 py-0.5 rounded-md font-mono border border-slate-700">v2.0</span>
+            <h1 class="text-base font-bold text-white">TechProfiler & L&D</h1>
+            <span class="text-[10px] bg-slate-800 text-slate-300 px-2 py-0.5 rounded font-mono border border-slate-700">Grupo Vazquez</span>
           </div>
-          <p class="text-xs text-emerald-400 font-medium">${dev.org_name} · Conglomerado Grupo Vázquez</p>
+          <p class="text-xs text-emerald-400 font-medium">${dev ? orgName : 'Portal de Evaluacion'}</p>
         </div>
       </div>
-      <div>
-        <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-          Supabase + Gemini 3 Conectados
-        </span>
+      <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2 bg-slate-950/80 border border-slate-800 rounded-xl px-3 py-1.5">
+          <span class="text-xs text-slate-400">Colaborador:</span>
+          <select id="userSelector" onchange="window.location.href='/?devId='+encodeURIComponent(this.value)" class="bg-transparent text-xs font-semibold text-white focus:outline-none cursor-pointer">
+            ${allDevs.map(d => `<option value="${escapeHtml(d.id)}" ${d.id === dev?.id ? 'selected' : ''} class="bg-slate-900 text-white">${escapeHtml(d.email.split('@')[0])} (${escapeHtml(d.org_name)})</option>`).join('')}
+          </select>
+        </div>
+        <button onclick="document.getElementById('regModal').classList.remove('hidden')" class="bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-bold px-3.5 py-2 rounded-xl transition">
+          + Registrar Colaborador
+        </button>
       </div>
     </div>
   </header>
 
-  <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
-    <!-- Header del Ingeniero -->
-    <div class="bg-gradient-to-r from-slate-900 via-slate-900 to-slate-850 border border-slate-800 rounded-2xl p-6 shadow-xl">
-      <div class="flex flex-col md:flex-row md:items-center justify-between gap-6">
-        <div>
-          <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">Perfil Técnico Evaluado</span>
-          <h2 class="text-2xl font-bold text-white mt-1">${dev.email}</h2>
-          <p class="text-sm text-slate-400 mt-1">Especialidad: <span class="text-slate-200 font-medium">${dev.tech_track}</span></p>
+  <main class="max-w-7xl mx-auto px-6 py-8 space-y-6">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col md:flex-row md:items-center justify-between gap-6">
+      <div>
+        <div class="inline-flex items-center gap-2 text-xs font-semibold uppercase text-slate-400 mb-1">
+          <span class="text-emerald-400 font-bold">${orgName}</span><span>|</span><span>Track: ${escapeHtml(dev?.tech_track || '-')}</span>
         </div>
-        <div class="flex items-center gap-4">
-          <div class="bg-slate-950/60 border border-slate-800 px-5 py-3 rounded-xl text-center">
-            <span class="block text-[11px] font-medium text-slate-400 uppercase tracking-wide">Nivel Base</span>
-            <span class="text-base font-bold text-amber-400">${dev.current_seniority}</span>
-          </div>
-          <span class="text-slate-600 text-xl font-bold">➔</span>
-          <div class="bg-slate-950/60 border border-emerald-500/30 px-5 py-3 rounded-xl text-center shadow-lg shadow-emerald-500/5">
-            <span class="block text-[11px] font-medium text-emerald-400 uppercase tracking-wide">Meta de Promoción</span>
-            <span class="text-base font-bold text-emerald-400">${dev.target_seniority}</span>
-          </div>
+        <h2 class="text-2xl font-bold text-white">${escapeHtml(dev?.email || 'Sin colaborador registrado')}</h2>
+      </div>
+      <div class="flex items-center gap-4">
+        <div class="bg-slate-950/60 border border-slate-800 px-4 py-2.5 rounded-xl text-center">
+          <span class="block text-[10px] text-slate-400 uppercase">Nivel Actual</span>
+          <span class="text-sm font-bold text-amber-400">${escapeHtml(dev?.current_seniority || '-')}</span>
+        </div>
+        <span class="text-slate-600 text-lg">-></span>
+        <div class="bg-slate-950/60 border border-emerald-500/30 px-4 py-2.5 rounded-xl text-center">
+          <span class="block text-[10px] text-emerald-400 uppercase">Meta</span>
+          <span class="text-sm font-bold text-emerald-400">${escapeHtml(dev?.target_seniority || '-')}</span>
         </div>
       </div>
     </div>
 
-    <!-- NUEVO: SIMULADOR DE PULL REQUEST EN VIVO -->
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
-      <div class="flex items-center justify-between">
-        <div>
-          <h3 class="text-base font-bold text-white flex items-center gap-2">
-            <span>⚡ Simulador de Pull Request en Vivo</span>
-          </h3>
-          <p class="text-xs text-slate-400 mt-0.5">Envía código para que el Agente Evaluador lo califique en tiempo real y expanda el radar.</p>
-        </div>
-        <div class="flex items-center gap-2">
-          <button onclick="loadSample('clean')" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition">
-            Ejemplo: Clean Architecture
-          </button>
-          <button onclick="loadSample('owasp')" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition">
-            Ejemplo: Seguridad Zod
-          </button>
-        </div>
-      </div>
-
-      <div class="space-y-3">
-        <textarea id="codeInput" rows="5" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-emerald-500/50 transition" placeholder="Pega aquí el código de un Pull Request para evaluar..."></textarea>
-        <div class="flex items-center justify-between">
-          <span id="statusMsg" class="text-xs text-slate-400"></span>
-          <button onclick="submitEvaluation()" id="submitBtn" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-5 py-2.5 rounded-xl text-sm transition flex items-center gap-2 shadow-lg shadow-emerald-500/10">
-            <span>🚀 Analizar con Agente IA</span>
-          </button>
-        </div>
-      </div>
+    <div class="flex flex-wrap items-center gap-3 border-b border-slate-800 pb-3">
+      <button onclick="switchTab('radar')" id="tab-btn-radar" class="tab-btn px-4 py-2 rounded-xl text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">Tech Radar</button>
+      <button onclick="switchTab('pos')" id="tab-btn-pos" class="tab-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-900 border border-transparent">Proof of Skills</button>
+      <button onclick="switchTab('courses')" id="tab-btn-courses" class="tab-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-900 border border-transparent">Capsulas L&D (${currentModulesCount})</button>
+      <button onclick="switchTab('admin')" id="tab-btn-admin" class="tab-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-900 border border-transparent">Piloto Itti (${escapeHtml(ittiStats.total_developers || 0)})</button>
     </div>
 
-    <!-- Grid: Radar SVG y Desglose -->
-    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-      <!-- Radar Nativo SVG -->
+    <div id="view-radar" class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
       <div class="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col items-center">
-        <div class="w-full flex items-center justify-between mb-2">
-          <div>
-            <h3 class="text-base font-bold text-white">Tech Radar de Habilidades</h3>
-            <p class="text-xs text-slate-400">Dimensiones calculadas con pgvector</p>
-          </div>
-          <span class="text-[11px] font-mono bg-slate-800 text-slate-300 px-2 py-1 rounded">Escala 1 - 5</span>
+        <div class="w-full flex justify-between mb-2">
+          <h3 class="text-base font-bold text-white">Tech Radar de Habilidades</h3>
+          <span class="text-[10px] font-mono bg-slate-800 text-slate-300 px-2 py-0.5 rounded">pgvector</span>
         </div>
-
-        <div class="w-full flex items-center justify-center py-4">
-          ${radarSvg}
-        </div>
-
+        <div class="w-full flex justify-center py-2">${radarSvg}</div>
         <div class="w-full grid grid-cols-2 gap-3 mt-2 pt-4 border-t border-slate-800 text-xs">
-          <div class="flex items-center gap-2 text-slate-300">
-            <span class="w-3 h-3 rounded-full bg-emerald-500"></span>
-            <span>Nivel Actual de Carlos</span>
-          </div>
-          <div class="flex items-center gap-2 text-slate-300">
-            <span class="w-3 h-1 bg-amber-400"></span>
-            <span>Meta Mid 2 (${dev.target_seniority})</span>
-          </div>
+          <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-emerald-500"></span><span>Nivel actual</span></div>
+          <div class="flex items-center gap-2"><span class="w-3 h-1 bg-amber-400"></span><span>Meta (${escapeHtml(dev?.target_seniority || '-')})</span></div>
         </div>
       </div>
 
-      <!-- Desglose de Competencias -->
       <div class="lg:col-span-6 space-y-3">
-        <div class="flex items-center justify-between mb-1">
-          <h3 class="text-base font-bold text-white">Desglose por Competencia</h3>
-          <span class="text-xs text-slate-400">5 Habilidades Evaluadas</span>
+        <h3 class="text-base font-bold text-white mb-2">Desglose de Competencias</h3>
+        ${skills.map(s => {
+          const cur = Number(s.current_score);
+          const req = Number(s.required_score);
+          const gap = cur - req;
+          const passed = gap >= 0;
+          return `
+          <div class="bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-2">
+            <div class="flex justify-between items-center gap-3">
+              <div>
+                <h4 class="text-sm font-bold text-white">${escapeHtml(s.display_name)}</h4>
+                <p class="text-xs text-slate-400">Nota: <span class="font-bold text-white">${cur.toFixed(2)}</span> / 5.00 | Requerido: ${req.toFixed(2)}</p>
+              </div>
+              <span class="px-2.5 py-1 rounded-full text-xs font-semibold ${passed ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/10 text-rose-400 border border-rose-500/30'}">
+                ${passed ? 'Superado +' + gap.toFixed(1) : 'Deficit ' + gap.toFixed(1)}
+              </span>
+            </div>
+            <div class="w-full bg-slate-950 rounded-full h-1.5 overflow-hidden">
+              <div class="${passed ? 'bg-emerald-500' : 'bg-rose-500'} h-1.5 rounded-full" style="width: ${Math.min(100, (cur / 5) * 100)}%"></div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+
+    <div id="view-pos" class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4 hidden">
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-4">
+        <div>
+          <span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">CASOS REALES ${escapeHtml(dev?.org_name?.toUpperCase() || '-')}</span>
+          <h3 class="text-lg font-bold text-white mt-1">Evaluacion Conversacional con el Agente Arquitecto</h3>
+          <p class="text-xs text-slate-400">Responde en tus propias palabras. Esto genera evidencia tecnica para el radar.</p>
         </div>
-        <div class="space-y-3">
-          ${skills.map(s => {
-            const current = Number(s.current_score);
-            const req = Number(s.required_score);
-            const gap = current - req;
-            const isPassed = gap >= 0;
-            const progressPct = Math.min(100, Math.round((current / 5) * 100));
-            return `
-            <div class="bg-slate-900 border border-slate-800 hover:border-slate-700 transition p-4 rounded-xl space-y-2">
-              <div class="flex items-center justify-between">
-                <div>
-                  <h4 class="text-sm font-bold text-white">${s.display_name}</h4>
-                  <p class="text-xs text-slate-400 mt-0.5">Nota: <span class="font-bold text-white">${current.toFixed(2)}</span> / 5.00 · Requerido para ${dev.target_seniority}: <span class="text-slate-300">${req.toFixed(2)}</span></p>
-                </div>
-                <div>
-                  <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold ${
-                    isPassed 
-                      ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' 
-                      : 'bg-rose-500/10 text-rose-400 border border-rose-500/30'
-                  }">
-                    ${isPassed ? '✓ Superado (+' + gap.toFixed(1) + ')' : '⚠ Déficit (' + gap.toFixed(1) + ')'}
-                  </span>
-                </div>
-              </div>
-              <div class="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
-                <div class="${isPassed ? 'bg-emerald-500' : 'bg-rose-500'} h-2 rounded-full transition-all duration-500" style="width: ${progressPct}%"></div>
-              </div>
-            </div>`;
-          }).join('')}
+        <div class="flex gap-2">
+          <button onclick="startPoS()" id="btnStartPoS" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition">Iniciar Entrevista</button>
+          <button onclick="finishPoS()" id="btnFinishPoS" class="bg-slate-800 hover:bg-slate-700 text-white font-bold px-4 py-2 rounded-xl text-xs border border-slate-700 transition hidden">Finalizar y Certificar</button>
         </div>
       </div>
+      <div id="chatBox" class="bg-slate-950 border border-slate-800 rounded-2xl p-4 h-96 overflow-y-auto space-y-4 text-xs">
+        <div class="text-center text-slate-500 py-16">Haz clic en Iniciar Entrevista para recibir tu primer caso practico.</div>
+      </div>
+      <div class="flex gap-2">
+        <textarea id="chatInput" rows="2" disabled class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 transition disabled:opacity-50" placeholder="Escribe tu analisis tecnico, arquitectura o solucion..."></textarea>
+        <button onclick="sendMessage()" id="btnSend" disabled class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-5 rounded-xl text-xs transition disabled:opacity-50">Enviar</button>
+      </div>
+    </div>
+
+    <div id="view-courses" class="space-y-4 hidden">
+      ${modules.map(m => `
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-3">
+          <div class="flex justify-between items-center border-b border-slate-800 pb-3 gap-3">
+            <div>
+              <span class="text-[11px] font-bold ${m.status === 'COMPLETED' ? 'text-emerald-400' : 'text-amber-400'}">${escapeHtml(m.status)}</span>
+              <h4 class="text-lg font-bold text-white">${escapeHtml(m.title)}</h4>
+            </div>
+            <span class="text-xs text-slate-400">${escapeHtml(m.skill_key)}</span>
+          </div>
+          <p class="text-xs text-slate-300 leading-relaxed">${escapeHtml(m.content_blocks?.explanation || 'Modulo L&D')}</p>
+        </div>
+      `).join('')}
+    </div>
+
+    <div id="view-admin" class="grid grid-cols-1 lg:grid-cols-12 gap-6 hidden">
+      <section class="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+        <div>
+          <span class="text-[10px] font-bold uppercase text-emerald-400">Facilitador</span>
+          <h3 class="text-lg font-bold text-white">Carga de cohorte Itti</h3>
+          <p class="text-xs text-slate-400 mt-1">Pega hasta 100 filas CSV. Para el piloto inicial usa 20 colaboradores.</p>
+        </div>
+        <div class="grid grid-cols-2 gap-3 text-xs">
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-3"><span class="block text-slate-400">Colaboradores</span><strong class="text-2xl text-white">${escapeHtml(ittiStats.total_developers || 0)}</strong></div>
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-3"><span class="block text-slate-400">Sesiones PoS</span><strong class="text-2xl text-white">${escapeHtml(ittiStats.completed_sessions || 0)}</strong></div>
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-3"><span class="block text-slate-400">Modulos asignados</span><strong class="text-2xl text-white">${escapeHtml(ittiStats.assigned_modules || 0)}</strong></div>
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-3"><span class="block text-slate-400">Modulos completados</span><strong class="text-2xl text-white">${escapeHtml(ittiStats.completed_modules || 0)}</strong></div>
+        </div>
+        <div class="space-y-2">
+          <label class="block text-xs font-semibold text-slate-300">CSV de colaboradores</label>
+          <textarea id="bulkCsv" rows="10" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-200 font-mono focus:outline-none focus:border-emerald-500" spellcheck="false">email,current_seniority,target_seniority,tech_track
+ana.gomez@itti.digital,JUNIOR_2,MID_2,BACKEND_NODE
+bruno.rios@itti.digital,MID_1,SENIOR_1,FULLSTACK</textarea>
+        </div>
+        <div class="flex items-center justify-between gap-3">
+          <p class="text-[11px] text-slate-500">Organizacion destino: itti Digital</p>
+          <button onclick="importCollaborators()" id="btnImportCsv" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition">Importar CSV</button>
+        </div>
+      </section>
+
+      <section class="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+        <div>
+          <span class="text-[10px] font-bold uppercase text-slate-400">Control operativo</span>
+          <h3 class="text-lg font-bold text-white">Resultado de importacion</h3>
+          <p class="text-xs text-slate-400 mt-1">Los registros validos se crean o actualizan. Las filas invalidas se reportan sin bloquear toda la carga.</p>
+        </div>
+        <div id="importResult" class="bg-slate-950 border border-slate-800 rounded-xl p-4 text-xs text-slate-400 min-h-40">Aun no hay importaciones en esta sesion.</div>
+        <div class="border-t border-slate-800 pt-4">
+          <h4 class="text-sm font-bold text-white mb-2">Formato esperado</h4>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-300">
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-3">email: correo corporativo unico</div>
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-3">current_seniority: JUNIOR_1, JUNIOR_2, MID_1, MID_2, SENIOR_1</div>
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-3">target_seniority: JUNIOR_1, JUNIOR_2, MID_1, MID_2, SENIOR_1</div>
+            <div class="bg-slate-950 border border-slate-800 rounded-xl p-3">tech_track: BACKEND_NODE, FRONTEND_REACT, FULLSTACK</div>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
 
+  <div id="regModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl space-y-3 text-xs">
+      <h3 class="text-base font-bold text-white border-b border-slate-800 pb-2">Registrar Colaborador</h3>
+      <div><label class="block text-slate-400 mb-1">Correo Corporativo:</label><input id="regEmail" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white" placeholder="ej. laura@itti.digital"></div>
+      <div><label class="block text-slate-400 mb-1">Empresa:</label><select id="regOrg" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white"><option value="ueno-bank">ueno bank</option><option value="itti">itti Digital</option><option value="kaitel">kaitel Paraguay</option></select></div>
+      <div><label class="block text-slate-400 mb-1">Track:</label><select id="regTrack" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white"><option value="BACKEND_NODE">Backend Node.js</option><option value="FRONTEND_REACT">Frontend React</option><option value="FULLSTACK">Fullstack</option></select></div>
+      <div class="grid grid-cols-2 gap-2">
+        <div><label class="block text-slate-400 mb-1">Nivel Actual:</label><select id="regCur" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-white"><option value="JUNIOR_1">Junior 1</option><option value="JUNIOR_2" selected>Junior 2</option><option value="MID_1">Mid 1</option></select></div>
+        <div><label class="block text-slate-400 mb-1">Meta:</label><select id="regTar" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-white"><option value="MID_2" selected>Mid 2</option><option value="SENIOR_1">Senior 1</option></select></div>
+      </div>
+      <div class="pt-3 flex justify-end gap-2">
+        <button onclick="document.getElementById('regModal').classList.add('hidden')" class="px-3 py-1.5 text-slate-400">Cancelar</button>
+        <button onclick="register()" class="bg-emerald-500 text-slate-950 font-bold px-4 py-1.5 rounded-xl">Crear Perfil</button>
+      </div>
+    </div>
+  </div>
+
   <script>
-    const samples = {
-      clean: \`// Módulo aplicando Clean Architecture e Inversión de Dependencias
-export class AccountService {
-  constructor(private readonly accountRepo: AccountRepository, private readonly logger: LoggerService) {}
+    const devId = ${JSON.stringify(selectedDevId)};
+    let history = [];
 
-  async getAccountBalance(accountId: string): Promise<AccountDto> {
-    const account = await this.accountRepo.findById(accountId);
-    if (!account) throw new NotFoundException('Account not found');
-    this.logger.info('Account retrieved successfully', { accountId });
-    return AccountMapper.toDto(account);
-  }
-}\`,
-      owasp: \`// Validación defensiva estricta con Zod Schema para prevenir inyecciones
-import { z } from 'zod';
-
-const TransferSchema = z.object({
-  senderId: z.string().uuid(),
-  receiverId: z.string().uuid(),
-  amount: z.number().positive().max(50000000)
-});
-
-export function validateTransfer(input: unknown) {
-  const parsed = TransferSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new ValidationError(parsed.error.format());
-  }
-  return parsed.data;
-}\`
-    };
-
-    function loadSample(type) {
-      document.getElementById('codeInput').value = samples[type];
+    function switchTab(t) {
+      ['radar', 'pos', 'courses', 'admin'].forEach(tab => {
+        document.getElementById('view-' + tab).classList.toggle('hidden', tab !== t);
+        const btn = document.getElementById('tab-btn-' + tab);
+        btn.className = tab === t
+          ? 'tab-btn px-4 py-2 rounded-xl text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+          : 'tab-btn px-4 py-2 rounded-xl text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-900 border border-transparent';
+      });
     }
 
-    async function submitEvaluation() {
-      const code = document.getElementById('codeInput').value.trim();
-      if (!code) {
-        alert('Por favor ingresa o carga un fragmento de código primero.');
-        return;
+    async function requestJson(url, options) {
+      const res = await fetch(url, options);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) throw new Error(data.error || 'No se pudo completar la operacion');
+      return data;
+    }
+
+    function renderImportResult(data) {
+      const box = document.getElementById('importResult');
+      box.replaceChildren();
+      const summary = document.createElement('div');
+      summary.className = 'mb-3 text-slate-200';
+      summary.textContent = 'Importados: ' + data.importedCount + ' | Errores: ' + data.errorCount;
+      box.appendChild(summary);
+
+      if (data.imported?.length) {
+        const title = document.createElement('div');
+        title.className = 'font-bold text-emerald-400 mb-1';
+        title.textContent = 'Filas importadas';
+        box.appendChild(title);
+        const list = document.createElement('ul');
+        list.className = 'space-y-1 mb-3';
+        for (const item of data.imported) {
+          const li = document.createElement('li');
+          li.textContent = 'Fila ' + item.row + ': ' + item.email;
+          list.appendChild(li);
+        }
+        box.appendChild(list);
       }
 
-      const btn = document.getElementById('submitBtn');
-      const msg = document.getElementById('statusMsg');
+      if (data.errors?.length) {
+        const title = document.createElement('div');
+        title.className = 'font-bold text-rose-400 mb-1';
+        title.textContent = 'Filas con error';
+        box.appendChild(title);
+        const list = document.createElement('ul');
+        list.className = 'space-y-1';
+        for (const item of data.errors) {
+          const li = document.createElement('li');
+          li.textContent = 'Fila ' + item.row + ' (' + (item.email || 'sin correo') + '): ' + item.error;
+          list.appendChild(li);
+        }
+        box.appendChild(list);
+      }
+    }
 
+    async function importCollaborators() {
+      const btn = document.getElementById('btnImportCsv');
       btn.disabled = true;
-      btn.innerHTML = '<span>⏳ Evaluando con Gemini 3 Flash...</span>';
-      msg.innerText = 'El agente está consultando las rúbricas y analizando el código...';
-
+      btn.textContent = 'Importando...';
       try {
-        const res = await fetch('/api/evaluate', {
+        const data = await requestJson('/api/admin/import-collaborators', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code })
+          body: JSON.stringify({ orgSlug: 'itti', csvText: document.getElementById('bulkCsv').value })
         });
-        const data = await res.json();
-        if (data.success) {
-          msg.innerText = '✅ ¡Evaluación completada con éxito! Actualizando radar...';
-          setTimeout(() => { window.location.reload(); }, 1200);
-        } else {
-          alert('Error en la evaluación: ' + (data.error || 'Desconocido'));
-          btn.disabled = false;
-          btn.innerHTML = '<span>🚀 Analizar con Agente IA</span>';
-        }
+        renderImportResult(data);
       } catch (err) {
-        alert('Error de conexión: ' + err.message);
+        document.getElementById('importResult').textContent = err.message;
+      } finally {
         btn.disabled = false;
-        btn.innerHTML = '<span>🚀 Analizar con Agente IA</span>';
+        btn.textContent = 'Importar CSV';
+      }
+    }
+
+    async function register() {
+      const email = document.getElementById('regEmail').value.trim();
+      if (!email) return alert('Ingresa un correo');
+      try {
+        const data = await requestJson('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email,
+            orgSlug: document.getElementById('regOrg').value,
+            techTrack: document.getElementById('regTrack').value,
+            currentSeniority: document.getElementById('regCur').value,
+            targetSeniority: document.getElementById('regTar').value
+          })
+        });
+        if (data.success) window.location.href = '/?devId=' + encodeURIComponent(data.dev.id);
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    async function startPoS() {
+      const btn = document.getElementById('btnStartPoS');
+      btn.textContent = 'Conectando...';
+      btn.disabled = true;
+      try {
+        const data = await requestJson('/api/pos/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ devId })
+        });
+        history = [{ role: 'agent', message: data.welcomeMessage }];
+        renderChat();
+        document.getElementById('chatInput').disabled = false;
+        document.getElementById('btnSend').disabled = false;
+        btn.classList.add('hidden');
+        document.getElementById('btnFinishPoS').classList.remove('hidden');
+      } catch (err) {
+        btn.textContent = 'Iniciar Entrevista';
+        btn.disabled = false;
+        alert(err.message);
+      }
+    }
+
+    function renderChat() {
+      const box = document.getElementById('chatBox');
+      box.replaceChildren();
+      for (const h of history) {
+        const isUser = h.role === 'user';
+        const row = document.createElement('div');
+        row.className = 'flex items-start gap-2 ' + (isUser ? 'justify-end' : '');
+
+        const avatar = document.createElement('div');
+        avatar.className = isUser
+          ? 'w-6 h-6 rounded bg-slate-800 text-slate-300 flex items-center justify-center font-bold text-[10px] shrink-0'
+          : 'w-6 h-6 rounded bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-[10px] shrink-0';
+        avatar.textContent = isUser ? 'Tu' : 'IA';
+
+        const bubble = document.createElement('div');
+        bubble.className = (isUser ? 'bg-emerald-600 text-white' : 'bg-slate-900 border border-slate-800') + ' p-3 rounded-xl max-w-lg whitespace-pre-wrap leading-relaxed';
+        bubble.textContent = h.message || '';
+
+        if (!isUser) row.appendChild(avatar);
+        row.appendChild(bubble);
+        if (isUser) row.appendChild(avatar);
+        box.appendChild(row);
+      }
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('chatInput');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      history.push({ role: 'user', message: text });
+      renderChat();
+
+      const btn = document.getElementById('btnSend');
+      btn.disabled = true;
+      btn.textContent = 'Pensando...';
+
+      try {
+        const data = await requestJson('/api/pos/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ devId, history, userResponse: text })
+        });
+        history.push({ role: 'agent', message: data.interviewerReply });
+        renderChat();
+      } catch (err) {
+        history.push({ role: 'agent', message: 'No pude procesar la respuesta: ' + err.message });
+        renderChat();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Enviar';
+      }
+    }
+
+    async function finishPoS() {
+      if (history.length < 2) return alert('Responde al menos a una pregunta antes de certificar.');
+      const btn = document.getElementById('btnFinishPoS');
+      btn.textContent = 'Certificando...';
+      btn.disabled = true;
+
+      try {
+        const data = await requestJson('/api/pos/evaluate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ devId, history })
+        });
+        alert('Entrevista completada. Dictamen: ' + data.verdict.summary);
+        window.location.reload();
+      } catch (err) {
+        alert(err.message);
+        btn.disabled = false;
+        btn.textContent = 'Finalizar y Certificar';
       }
     }
   </script>
@@ -423,42 +824,80 @@ export function validateTransfer(input: unknown) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'POST' && req.url === '/api/evaluate') {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const sendJson = (data, status = 200) => {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(data));
+  };
+
+  if (req.method === 'POST') {
     let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
+    let bodyTooLarge = false;
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 256_000) bodyTooLarge = true;
+    });
     req.on('end', async () => {
       try {
-        const { code } = JSON.parse(body);
-        const result = await evaluateCodeSnippet(code);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, result }));
+        if (bodyTooLarge) return sendJson({ error: 'Solicitud demasiado grande' }, 413);
+        let payload;
+        try {
+          payload = JSON.parse(body || '{}');
+        } catch {
+          return sendJson({ error: 'JSON invalido' }, 400);
+        }
+
+        if (url.pathname === '/api/register') {
+          const dev = await registerDeveloper(payload);
+          return sendJson({ success: true, dev });
+        }
+        if (url.pathname === '/api/admin/import-collaborators') {
+          return sendJson(await importCollaborators(payload));
+        }
+        if (url.pathname === '/api/pos/start') {
+          return sendJson(await startPoS(payload.devId));
+        }
+        if (url.pathname === '/api/pos/chat') {
+          return sendJson(await chatPoS(payload.devId, payload.history, payload.userResponse));
+        }
+        if (url.pathname === '/api/pos/evaluate') {
+          return sendJson({ success: true, verdict: await finishPoS(payload.devId, payload.history) });
+        }
+        return sendJson({ error: 'Endpoint no encontrado' }, 404);
       } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        console.error('Dashboard API error:', err);
+        return sendJson({ error: 'No se pudo completar la operacion' }, 500);
       }
     });
     return;
   }
 
-  if (req.url === '/' || req.url === '') {
+  if (url.pathname === '/' || url.pathname === '') {
     try {
-      const data = await getDashboardData();
-      const html = renderHTML(data);
+      const data = await getDashboardData(url.searchParams.get('devId') || url.searchParams.get('devid'));
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
+      res.end(renderHTML(data));
     } catch (err) {
+      console.error('Dashboard render error:', err);
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('Error cargando el dashboard: ' + err.message);
+      res.end('Error interno al renderizar el dashboard');
     }
-  } else {
-    res.writeHead(404);
-    res.end('Not found');
+    return;
   }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not found');
+});
+
+server.on('error', err => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Puerto ${PORT} ocupado. Usa DASHBOARD_PORT=otro_puerto o detiene el proceso anterior.`);
+  } else {
+    console.error('Dashboard server error:', err);
+  }
+  process.exit(1);
 });
 
 server.listen(PORT, () => {
-  console.log('=======================================================');
-  console.log(`🚀 TECHPROFILER DASHBOARD CON SIMULADOR ACTIVO EN:`);
-  console.log(`👉 http://localhost:${PORT}`);
-  console.log('=======================================================');
+  console.log(`TECHPROFILER ACTIVO EN: http://localhost:${PORT}`);
 });

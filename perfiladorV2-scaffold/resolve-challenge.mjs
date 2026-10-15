@@ -1,6 +1,10 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import {
+  challengeVerdictSchema,
+  parseJsonWithSchema
+} from './packages/schemas/src/ai-contracts.mjs';
 
 dotenv.config();
 
@@ -114,7 +118,11 @@ Responde ÚNICAMENTE en JSON con esta estructura:
     config: { responseMimeType: 'application/json' }
   });
 
-  const verdict = JSON.parse(response.text.trim());
+  const verdict = parseJsonWithSchema(
+    response.text,
+    challengeVerdictSchema,
+    'ChallengeEvaluatorAgent response'
+  );
 
   console.log("\n=======================================================");
   console.log("📋 RESULTADO DEL AGENTE VERIFICADOR:");

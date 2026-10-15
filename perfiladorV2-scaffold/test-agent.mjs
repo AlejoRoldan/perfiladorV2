@@ -1,6 +1,10 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import {
+  codeEvaluationResponseSchema,
+  parseJsonWithSchema
+} from './packages/schemas/src/ai-contracts.mjs';
 
 dotenv.config();
 
@@ -85,7 +89,11 @@ Responde ÚNICAMENTE en formato JSON con esta estructura:
   console.log("\n=========================================");
   console.log("📊 RESULTADO DEL DIAGNÓSTICO AGÉNTICO:");
   console.log("=========================================");
-  const parsed = JSON.parse(response.text.trim());
+  const parsed = parseJsonWithSchema(
+    response.text,
+    codeEvaluationResponseSchema,
+    'CodeQualityProfilerAgent test response'
+  );
   console.log(JSON.stringify(parsed, null, 2));
 }
 
