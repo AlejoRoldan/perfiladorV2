@@ -31,5 +31,10 @@ export function createDatabasePool(connectionString = resolveDatabaseUrl()) {
   });
 }
 
+type DrizzleLikeDb = {
+  select: (...args: unknown[]) => any;
+  insert: (...args: unknown[]) => any;
+};
+
 export const pool = createDatabasePool();
-export const db = drizzle(pool, { schema });
+export const db = drizzle(pool, { schema }) as DrizzleLikeDb;

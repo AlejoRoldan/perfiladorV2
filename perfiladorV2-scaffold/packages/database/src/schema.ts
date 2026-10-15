@@ -30,7 +30,7 @@ export const developers = pgTable('developers', {
   techTrack: text('tech_track').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
-}, (table) => ({
+}, (table: any) => ({
   orgIdIdx: index('idx_developers_org_id').on(table.orgId),
   emailIdx: index('idx_developers_email').on(table.email)
 }));
@@ -43,7 +43,7 @@ export const skillTaxonomy = pgTable('skill_taxonomy', {
   rubricLevels: jsonb('rubric_levels').default({}).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
-}, (table) => ({
+}, (table: any) => ({
   domainIdx: index('idx_skill_taxonomy_domain').on(table.domain)
 }));
 
@@ -55,7 +55,7 @@ export const seniorityBenchmarks = pgTable('seniority_benchmarks', {
   requiredScore: numeric('required_score', { precision: 3, scale: 2 }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
-}, (table) => ({
+}, (table: any) => ({
   requiredScoreCheck: check('seniority_benchmarks_required_score_check', sql`${table.requiredScore} >= 1 AND ${table.requiredScore} <= 5`),
   uniqueBenchmark: uniqueIndex('seniority_benchmarks_skill_track_level_unique').on(table.skillKey, table.track, table.seniorityLevel),
   lookupIdx: index('idx_benchmarks_lookup').on(table.track, table.seniorityLevel, table.skillKey)
@@ -70,7 +70,7 @@ export const developerSkillMatrix = pgTable('developer_skill_matrix', {
   gapVsTarget: numeric('gap_vs_target', { precision: 4, scale: 2 }).default('0.00').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
-}, (table) => ({
+}, (table: any) => ({
   pk: primaryKey({ columns: [table.developerId, table.skillKey] }),
   currentScoreCheck: check('developer_skill_matrix_current_score_check', sql`${table.currentScore} >= 0 AND ${table.currentScore} <= 5`),
   confidenceScoreCheck: check('developer_skill_matrix_confidence_score_check', sql`${table.confidenceScore} >= 0 AND ${table.confidenceScore} <= 1`),
@@ -85,7 +85,7 @@ export const evaluationSignals = pgTable('evaluation_signals', {
   diffSummary: jsonb('diff_summary').default({}).notNull(),
   rawEvaluations: jsonb('raw_evaluations').default({}).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull()
-}, (table) => ({
+}, (table: any) => ({
   developerCreatedIdx: index('idx_evaluation_signals_developer_created').on(table.developerId, table.createdAt)
 }));
 
@@ -100,29 +100,29 @@ export const learningModules = pgTable('learning_modules', {
   completedAt: timestamp('completed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull()
-}, (table) => ({
+}, (table: any) => ({
   statusCheck: check('learning_modules_status_check', sql`${table.status} IN ('ASSIGNED', 'IN_PROGRESS', 'COMPLETED', 'ARCHIVED')`),
   developerStatusIdx: index('idx_learning_modules_developer_status').on(table.developerId, table.status, table.createdAt)
 }));
 
-export const organizationsRelations = relations(organizations, ({ many }) => ({
+export const organizationsRelations = relations(organizations, ({ many }: any) => ({
   developers: many(developers)
 }));
 
-export const developersRelations = relations(developers, ({ one, many }) => ({
+export const developersRelations = relations(developers, ({ one, many }: any) => ({
   organization: one(organizations, { fields: [developers.orgId], references: [organizations.id] }),
   skills: many(developerSkillMatrix),
   signals: many(evaluationSignals),
   modules: many(learningModules)
 }));
 
-export const skillTaxonomyRelations = relations(skillTaxonomy, ({ many }) => ({
+export const skillTaxonomyRelations = relations(skillTaxonomy, ({ many }: any) => ({
   developerSkills: many(developerSkillMatrix),
   benchmarks: many(seniorityBenchmarks),
   modules: many(learningModules)
 }));
 
-export const developerSkillMatrixRelations = relations(developerSkillMatrix, ({ one }) => ({
+export const developerSkillMatrixRelations = relations(developerSkillMatrix, ({ one }: any) => ({
   developer: one(developers, { fields: [developerSkillMatrix.developerId], references: [developers.id] }),
   skill: one(skillTaxonomy, { fields: [developerSkillMatrix.skillKey], references: [skillTaxonomy.skillKey] })
 }));
