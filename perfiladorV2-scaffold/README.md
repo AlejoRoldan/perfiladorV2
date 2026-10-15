@@ -1,5 +1,11 @@
 # TechProfiler & L&D Platform (`perfiladorV2`)
 
+## Documentation
+
+Reviewer-facing documentation starts in [`docs/README.md`](./docs/README.md).
+
+It covers architecture, backend/frontend structure, the agent catalog, product scope, delivery roadmap, engineering standards, and pilot operations.
+
 > **Plataforma agÃ©ntica de perfilamiento continuo de capacidades tÃ©cnicas a lo largo del SDLC y generaciÃ³n personalizada de rutas de aprendizaje y laboratorios para ingenieros de software.**
 
 ---
