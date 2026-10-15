@@ -7,8 +7,11 @@ process.env.PILOT_IMPORT_ORG_SLUG = 'itti';
 const {
   HttpError,
   assertAdminImportAuthorized,
+  assertAllowedPostOrigin,
+  assertPostRequestAllowed,
   calculateEvidenceConfidence,
   createProofOfSkillsExternalRef,
+  getDeclaredContentLength,
   normalizeHistory,
   parseCollaboratorCsv,
   validateDeveloperInput
@@ -108,4 +111,57 @@ test('history normalization removes empty or malformed turns', () => {
   ]), [
     { role: 'user', message: 'respuesta' }
   ]);
+});
+
+test('POST requests reject text/plain and require JSON content type', () => {
+  assert.throws(
+    () => assertPostRequestAllowed({
+      headers: {
+        host: 'localhost:3005',
+        'content-type': 'text/plain'
+      }
+    }),
+    error => error instanceof HttpError && error.statusCode === 415
+  );
+
+  assert.doesNotThrow(() => assertPostRequestAllowed({
+    headers: {
+      host: 'localhost:3005',
+      'content-type': 'application/json; charset=utf-8'
+    }
+  }));
+});
+
+test('POST requests reject cross-origin browser submissions', () => {
+  assert.throws(
+    () => assertAllowedPostOrigin({
+      headers: {
+        host: 'localhost:3005',
+        origin: 'http://evil.example'
+      }
+    }),
+    error => error instanceof HttpError && error.statusCode === 403
+  );
+
+  assert.doesNotThrow(() => assertAllowedPostOrigin({
+    headers: {
+      host: 'localhost:3005',
+      origin: 'http://localhost:3005'
+    }
+  }));
+});
+
+test('POST requests reject oversized declared bodies before parsing', () => {
+  assert.equal(getDeclaredContentLength({ 'content-length': '256001' }), 256001);
+
+  assert.throws(
+    () => assertPostRequestAllowed({
+      headers: {
+        host: 'localhost:3005',
+        'content-type': 'application/json',
+        'content-length': '256001'
+      }
+    }),
+    error => error instanceof HttpError && error.statusCode === 413
+  );
 });

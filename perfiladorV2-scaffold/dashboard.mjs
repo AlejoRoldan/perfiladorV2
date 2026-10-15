@@ -17,6 +17,7 @@ const PORT = Number(process.env.DASHBOARD_PORT || 3005);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
 const SCHEMA_VERSION = '2026-09-29.pos.v1';
 const RUBRIC_VERSION = '2026-09-29.base-taxonomy.v1';
+const MAX_REQUEST_BODY_BYTES = Number(process.env.MAX_REQUEST_BODY_BYTES || 256_000);
 const ALLOWED_TRACKS = new Set(['BACKEND_NODE', 'FRONTEND_REACT', 'FULLSTACK']);
 const ALLOWED_SENIORITIES = new Set(['JUNIOR_1', 'JUNIOR_2', 'MID_1', 'MID_2', 'SENIOR_1']);
 
@@ -63,6 +64,46 @@ function assertAdminImportAuthorized(req) {
   const bearerToken = getBearerToken(req);
   if (headerToken !== ADMIN_IMPORT_TOKEN && bearerToken !== ADMIN_IMPORT_TOKEN) {
     throw new HttpError('No autorizado para importar colaboradores', 403);
+  }
+}
+
+function isJsonContentType(headers = {}) {
+  const contentType = normalizeText(headers['content-type'] || headers['Content-Type']).toLowerCase();
+  return contentType === 'application/json' || contentType.startsWith('application/json;');
+}
+
+function getRequestOrigin(req) {
+  const host = normalizeText(req.headers.host).toLowerCase();
+  const proto = normalizeText(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim().toLowerCase() || 'http';
+  return `${proto}://${host}`;
+}
+
+function assertAllowedPostOrigin(req) {
+  const origin = normalizeText(req.headers.origin);
+  if (!origin) return;
+
+  const expectedOrigin = getRequestOrigin(req);
+  if (origin.toLowerCase() !== expectedOrigin) {
+    throw new HttpError('Origen no autorizado para esta accion', 403);
+  }
+}
+
+function getDeclaredContentLength(headers = {}) {
+  const rawLength = normalizeText(headers['content-length'] || headers['Content-Length']);
+  if (!rawLength) return null;
+  const declared = Number(rawLength);
+  return Number.isFinite(declared) && declared >= 0 ? declared : null;
+}
+
+function assertPostRequestAllowed(req) {
+  if (!isJsonContentType(req.headers)) {
+    throw new HttpError('Content-Type debe ser application/json', 415);
+  }
+  assertAllowedPostOrigin(req);
+
+  const declaredLength = getDeclaredContentLength(req.headers);
+  if (declaredLength !== null && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    throw new HttpError('Solicitud demasiado grande', 413);
   }
 }
 
@@ -926,11 +967,23 @@ const server = http.createServer(async (req, res) => {
   };
 
   if (req.method === 'POST') {
+    try {
+      assertPostRequestAllowed(req);
+    } catch (err) {
+      req.resume();
+      if (err instanceof HttpError) return sendJson({ error: err.message }, err.statusCode);
+      return sendJson({ error: 'No se pudo completar la operacion' }, 500);
+    }
+
     let body = '';
     let bodyTooLarge = false;
     req.on('data', chunk => {
+      if (bodyTooLarge) return;
       body += chunk;
-      if (body.length > 256_000) bodyTooLarge = true;
+      if (Buffer.byteLength(body, 'utf8') > MAX_REQUEST_BODY_BYTES) {
+        bodyTooLarge = true;
+        body = '';
+      }
     });
     req.on('end', async () => {
       try {
@@ -1004,8 +1057,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   HttpError,
   assertAdminImportAuthorized,
+  assertAllowedPostOrigin,
+  assertPostRequestAllowed,
   calculateEvidenceConfidence,
   createProofOfSkillsExternalRef,
+  getDeclaredContentLength,
   normalizeHistory,
   parseCollaboratorCsv,
   validateDeveloperInput
