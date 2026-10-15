@@ -2,7 +2,7 @@ import http from 'http';
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
-import { URL } from 'url';
+import { URL, pathToFileURL } from 'url';
 import {
   parseJsonWithSchema,
   posChatResponseSchema,
@@ -29,12 +29,41 @@ const query = (text, params) => pool.query(text, params);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const normalizeText = value => String(value ?? '').trim();
 const normalizeEmail = value => normalizeText(value).toLowerCase();
+const normalizeOrgSlug = value => normalizeText(value).toLowerCase();
+const PILOT_IMPORT_ORG_SLUG = normalizeOrgSlug(process.env.PILOT_IMPORT_ORG_SLUG || 'itti');
+const ADMIN_IMPORT_TOKEN = normalizeText(process.env.ADMIN_IMPORT_TOKEN || '');
 const escapeHtml = value => String(value ?? '')
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
   .replaceAll('>', '&gt;')
   .replaceAll('"', '&quot;')
   .replaceAll("'", '&#39;');
+
+class HttpError extends Error {
+  constructor(message, statusCode = 400) {
+    super(message);
+    this.name = 'HttpError';
+    this.statusCode = statusCode;
+  }
+}
+
+function getBearerToken(req) {
+  const authorization = normalizeText(req.headers.authorization || '');
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? normalizeText(match[1]) : '';
+}
+
+function assertAdminImportAuthorized(req) {
+  if (!ADMIN_IMPORT_TOKEN) {
+    throw new HttpError('Importacion admin no configurada: falta ADMIN_IMPORT_TOKEN', 503);
+  }
+
+  const headerToken = normalizeText(req.headers['x-admin-token']);
+  const bearerToken = getBearerToken(req);
+  if (headerToken !== ADMIN_IMPORT_TOKEN && bearerToken !== ADMIN_IMPORT_TOKEN) {
+    throw new HttpError('No autorizado para importar colaboradores', 403);
+  }
+}
 
 async function askGemini(prompt, schema, label) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -133,7 +162,7 @@ async function getDashboardData(devId = null) {
 function validateDeveloperInput({ email, orgSlug, currentSeniority, targetSeniority, techTrack }) {
   const input = {
     email: normalizeEmail(email),
-    orgSlug: normalizeText(orgSlug || 'itti'),
+    orgSlug: normalizeOrgSlug(orgSlug || 'itti'),
     currentSeniority: normalizeText(currentSeniority || 'JUNIOR_2').toUpperCase(),
     targetSeniority: normalizeText(targetSeniority || 'MID_2').toUpperCase(),
     techTrack: normalizeText(techTrack || 'BACKEND_NODE').toUpperCase()
@@ -171,6 +200,7 @@ function parseCsvLine(line) {
 }
 
 function parseCollaboratorCsv(csvText, defaultOrgSlug = 'itti') {
+  const forcedOrgSlug = normalizeOrgSlug(defaultOrgSlug);
   const lines = String(csvText ?? '')
     .split(/\r?\n/)
     .map(line => line.trim())
@@ -188,7 +218,8 @@ function parseCollaboratorCsv(csvText, defaultOrgSlug = 'itti') {
     return {
       rowNumber: index + (hasHeader ? 2 : 1),
       email: row.email,
-      orgSlug: row.org_slug || row.organization || defaultOrgSlug,
+      orgSlug: forcedOrgSlug,
+      sourceOrgSlug: row.org_slug || row.organization || '',
       currentSeniority: row.current_seniority || row.currentSeniority,
       targetSeniority: row.target_seniority || row.targetSeniority,
       techTrack: row.tech_track || row.techTrack
@@ -201,12 +232,23 @@ async function registerDeveloper(input) {
   const orgRes = await query('SELECT id FROM organizations WHERE slug = $1 LIMIT 1', [devInput.orgSlug]);
   if (!orgRes.rows.length) throw new Error(`Organizacion no encontrada: ${devInput.orgSlug}`);
 
+  const existingDevRes = await query(`
+    SELECT d.id, d.email, d.org_id, o.slug AS org_slug
+    FROM developers d
+    JOIN organizations o ON d.org_id = o.id
+    WHERE d.email = $1
+    LIMIT 1
+  `, [devInput.email]);
+  const existingDev = existingDevRes.rows[0];
+  if (existingDev && existingDev.org_slug !== devInput.orgSlug) {
+    throw new Error(`El correo ya existe en la organizacion ${existingDev.org_slug}; no se puede mover entre organizaciones`);
+  }
+
   const devRes = await query(`
     INSERT INTO developers (org_id, email, github_username, current_seniority, target_seniority, tech_track)
     VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT (email) DO UPDATE
-    SET org_id = EXCLUDED.org_id,
-        current_seniority = EXCLUDED.current_seniority,
+    SET current_seniority = EXCLUDED.current_seniority,
         target_seniority = EXCLUDED.target_seniority,
         tech_track = EXCLUDED.tech_track,
         updated_at = now()
@@ -243,8 +285,8 @@ async function registerDeveloper(input) {
   return dev;
 }
 
-async function importCollaborators({ csvText, orgSlug = 'itti' }) {
-  const rows = parseCollaboratorCsv(csvText, orgSlug);
+async function importCollaborators({ csvText }) {
+  const rows = parseCollaboratorCsv(csvText, PILOT_IMPORT_ORG_SLUG);
   if (!rows.length) throw new Error('El CSV no contiene filas para importar');
   if (rows.length > 100) throw new Error('Maximo 100 colaboradores por importacion');
 
@@ -260,6 +302,14 @@ async function importCollaborators({ csvText, orgSlug = 'itti' }) {
         continue;
       }
       seen.add(email);
+      if (row.sourceOrgSlug && normalizeOrgSlug(row.sourceOrgSlug) !== PILOT_IMPORT_ORG_SLUG) {
+        errors.push({
+          row: row.rowNumber,
+          email,
+          error: `org_slug no permitido para piloto Itti: ${row.sourceOrgSlug}`
+        });
+        continue;
+      }
       const dev = await registerDeveloper(row);
       imported.push({ row: row.rowNumber, id: dev.id, email: dev.email });
     } catch (err) {
@@ -577,6 +627,10 @@ function renderHTML({ dev, skills, modules, allDevs, cohortStats }) {
 ana.gomez@itti.digital,JUNIOR_2,MID_2,BACKEND_NODE
 bruno.rios@itti.digital,MID_1,SENIOR_1,FULLSTACK</textarea>
         </div>
+        <div class="space-y-2">
+          <label class="block text-xs font-semibold text-slate-300">Token admin de importacion</label>
+          <input id="adminImportToken" type="password" autocomplete="off" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-200 focus:outline-none focus:border-emerald-500" placeholder="ADMIN_IMPORT_TOKEN">
+        </div>
         <div class="flex items-center justify-between gap-3">
           <p class="text-[11px] text-slate-500">Organizacion destino: itti Digital</p>
           <button onclick="importCollaborators()" id="btnImportCsv" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition">Importar CSV</button>
@@ -682,13 +736,14 @@ bruno.rios@itti.digital,MID_1,SENIOR_1,FULLSTACK</textarea>
 
     async function importCollaborators() {
       const btn = document.getElementById('btnImportCsv');
+      const adminToken = document.getElementById('adminImportToken').value.trim();
       btn.disabled = true;
       btn.textContent = 'Importando...';
       try {
         const data = await requestJson('/api/admin/import-collaborators', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ orgSlug: 'itti', csvText: document.getElementById('bulkCsv').value })
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
+          body: JSON.stringify({ csvText: document.getElementById('bulkCsv').value })
         });
         renderImportResult(data);
       } catch (err) {
@@ -852,6 +907,7 @@ const server = http.createServer(async (req, res) => {
           return sendJson({ success: true, dev });
         }
         if (url.pathname === '/api/admin/import-collaborators') {
+          assertAdminImportAuthorized(req);
           return sendJson(await importCollaborators(payload));
         }
         if (url.pathname === '/api/pos/start') {
@@ -866,6 +922,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson({ error: 'Endpoint no encontrado' }, 404);
       } catch (err) {
         console.error('Dashboard API error:', err);
+        if (err instanceof HttpError) return sendJson({ error: err.message }, err.statusCode);
         return sendJson({ error: 'No se pudo completar la operacion' }, 500);
       }
     });
@@ -898,6 +955,15 @@ server.on('error', err => {
   process.exit(1);
 });
 
-server.listen(PORT, () => {
-  console.log(`TECHPROFILER ACTIVO EN: http://localhost:${PORT}`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  server.listen(PORT, () => {
+    console.log(`TECHPROFILER ACTIVO EN: http://localhost:${PORT}`);
+  });
+}
+
+export {
+  HttpError,
+  assertAdminImportAuthorized,
+  parseCollaboratorCsv,
+  validateDeveloperInput
+};
