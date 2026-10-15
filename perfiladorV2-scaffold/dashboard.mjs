@@ -1,4 +1,5 @@
 import http from 'http';
+import crypto from 'crypto';
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
@@ -63,6 +64,40 @@ function assertAdminImportAuthorized(req) {
   if (headerToken !== ADMIN_IMPORT_TOKEN && bearerToken !== ADMIN_IMPORT_TOKEN) {
     throw new HttpError('No autorizado para importar colaboradores', 403);
   }
+}
+
+function normalizeHistory(history) {
+  return Array.isArray(history)
+    ? history.map(item => ({
+      role: normalizeText(item?.role),
+      message: normalizeText(item?.message)
+    })).filter(item => item.role && item.message)
+    : [];
+}
+
+function createProofOfSkillsExternalRef(devId, history, now = new Date()) {
+  const normalizedHistory = normalizeHistory(history);
+  const timestamp = now.toISOString().replace(/[-:.]/g, '').replace('T', '-').replace('Z', '');
+  const evidenceHash = crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ devId: normalizeText(devId), history: normalizedHistory }))
+    .digest('hex')
+    .slice(0, 16);
+  return `POS-${timestamp}-${evidenceHash}`;
+}
+
+function calculateEvidenceConfidence(history, skillEvaluationCount) {
+  const normalizedHistory = normalizeHistory(history);
+  const userTurns = normalizedHistory.filter(item => item.role === 'user').length;
+  const userTextLength = normalizedHistory
+    .filter(item => item.role === 'user')
+    .reduce((total, item) => total + item.message.length, 0);
+
+  const turnScore = Math.min(userTurns, 4) * 0.07;
+  const depthScore = Math.min(userTextLength / 1200, 1) * 0.14;
+  const breadthScore = Math.min(Number(skillEvaluationCount || 0), 4) * 0.04;
+  const confidence = 0.5 + turnScore + depthScore + breadthScore;
+  return Number(Math.min(0.95, Math.max(0.55, confidence)).toFixed(2));
 }
 
 async function askGemini(prompt, schema, label) {
@@ -381,18 +416,23 @@ Responde solo JSON:
 }`;
 
   const verdict = await askGemini(prompt, posFinalEvaluationSchema, 'PoS final evaluation');
+  const externalRef = createProofOfSkillsExternalRef(dev.id, history);
+  const confidenceScore = calculateEvidenceConfidence(history, verdict.skillEvaluations.length);
   const audit = {
     turns: history.length,
+    userTurns: normalizeHistory(history).filter(item => item.role === 'user').length,
     model: GEMINI_MODEL,
     promptFamily: 'proof-of-skills-interview',
     schemaVersion: SCHEMA_VERSION,
-    rubricVersion: RUBRIC_VERSION
+    rubricVersion: RUBRIC_VERSION,
+    externalRef,
+    confidenceScore
   };
 
   await query(`
     INSERT INTO evaluation_signals (developer_id, source_type, external_ref, diff_summary, raw_evaluations)
-    VALUES ($1, 'CONVERSATIONAL_PROOF_OF_SKILL', 'ENTREVISTA-POS', $2, $3)
-  `, [dev.id, JSON.stringify(audit), JSON.stringify({ ...verdict, audit })]);
+    VALUES ($1, 'CONVERSATIONAL_PROOF_OF_SKILL', $2, $3, $4)
+  `, [dev.id, externalRef, JSON.stringify(audit), JSON.stringify({ ...verdict, audit })]);
 
   for (const item of verdict.skillEvaluations) {
     const bench = await query(`
@@ -405,17 +445,17 @@ Responde solo JSON:
 
     await query(`
       INSERT INTO developer_skill_matrix (developer_id, skill_key, current_score, confidence_score, last_signal_at, gap_vs_target)
-      VALUES ($1, $2, $3, 0.98, now(), $4)
+      VALUES ($1, $2, $3, $4, now(), $5)
       ON CONFLICT (developer_id, skill_key) DO UPDATE
       SET current_score = EXCLUDED.current_score,
           confidence_score = EXCLUDED.confidence_score,
           last_signal_at = now(),
           gap_vs_target = EXCLUDED.gap_vs_target,
           updated_at = now()
-    `, [dev.id, item.skillKey, item.score, gap]);
+    `, [dev.id, item.skillKey, item.score, confidenceScore, gap]);
   }
 
-  return verdict;
+  return { ...verdict, audit };
 }
 
 function renderRadarSvg(skills) {
@@ -964,6 +1004,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export {
   HttpError,
   assertAdminImportAuthorized,
+  calculateEvidenceConfidence,
+  createProofOfSkillsExternalRef,
+  normalizeHistory,
   parseCollaboratorCsv,
   validateDeveloperInput
 };
