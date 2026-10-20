@@ -297,15 +297,14 @@ The system must export cohort and individual results for review.
 
 ### Stage 1: Pilot MVP
 
-- Run Itti pilot on `dashboard.mjs`.
-- Collect completion metrics.
-- Export results manually or through basic report endpoint.
+- Deliver the eight capabilities in [MVP acceptance](MVP_ACCEPTANCE.md) on `dashboard.mjs`: individual access, recoverable sessions, automatic learning, explainable radar, comparable assessment, facilitator actions, consent/cost controls and participant feedback.
+- Validate the complete flow in staging before inviting the cohort.
+- Measure unique participant completion, technical failures and usefulness with explicit denominators.
 
 ### Stage 2: Platform Beta
 
 - Migrate MVP into `apps/web` and `apps/api`.
-- Add authentication.
-- Add structured admin dashboard.
+- Evolve the pilot's existing individual authentication and facilitator view.
 
 ### Stage 3: SDLC Integration
 
@@ -321,8 +320,8 @@ The system must export cohort and individual results for review.
 
 ### Stage 5: Enterprise Hardening
 
-- Role-based access.
+- Extend the pilot's organization-scoped roles for enterprise administration.
 - Full audit logs.
-- Cost governance.
+- Extend the pilot's per-session cost cap to enterprise cost governance.
 - Human review workflow.
 - Production observability.
