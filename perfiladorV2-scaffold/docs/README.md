@@ -2,6 +2,8 @@
 
 This folder is the project documentation entrypoint for reviewers, engineers, and product stakeholders.
 
+For the closed pilot, start with [MVP scope and acceptance criteria](MVP_ACCEPTANCE.md) (2026-10-20). It defines the eight required capabilities, current local gaps, delivery order and pilot metrics. Broader platform stages below do not defer those MVP requirements.
+
 The documentation distinguishes between:
 
 - Current implementation: the MVP that exists today in the repository.
